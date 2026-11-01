@@ -256,10 +256,20 @@ warp_is_registered() {
 
 # Helper: chạy warp-cli, auto-accept ToS (pipe y vào stdin), redirect output vào log
 warp_cmd() {
-    # printf 'y\n' để trả lời ToS prompt nếu warp-cli hỏi
-    # </dev/null fallback phòng khi không có TTY
-    printf 'y\n' | timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" "$@" \
-        2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' | log_pipe warp || true
+    # warp-cli ghi ToS prompt ra /dev/tty trực tiếp (bypass stdout/stderr)
+    # Dùng 'script' để tạo pseudo-TTY, redirect /dev/tty của subprocess sang pipe
+    # Kết quả vào log, không ra stdout (tránh terminal corruption)
+    local out
+    if have_cmd script; then
+        # script -q -c "..." /dev/null: chạy trong pseudo-TTY, output capture được
+        out="$(printf 'y\n' | script -q -c \
+            "timeout $WARP_CALL_TIMEOUT $(printf '%q ' "$WARP_BIN" "$@")" \
+            /dev/null 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//g' || true)"
+    else
+        out="$(printf 'y\n' | timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" "$@" \
+            2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
+    fi
+    [ -n "$out" ] && log "warp_cmd $*: $out" warp
 }
 
 # Start WARP in proxy mode on PROXY_PORT
