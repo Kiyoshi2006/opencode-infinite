@@ -241,8 +241,27 @@ warp_up() {
 
     echo "    Connecting WARP proxy on port $PROXY_PORT..."
     "$WARP_BIN" disconnect 2>/dev/null | cat >/dev/null || true
+
+    # QUAN TRỌNG: phải set proxy mode TRƯỚC khi connect
+    # Tunnel mode sẽ route toàn bộ traffic → mất SSH trên VPS
     "$WARP_BIN" set-mode proxy 2>/dev/null || true
     "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
+
+    # Xác nhận mode đã được set đúng trước khi connect
+    local current_mode
+    current_mode="$("$WARP_BIN" settings 2>/dev/null \
+        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' \
+        | grep -i 'mode\|proxy' | head -2 || echo "")"
+    log "warp mode check: $current_mode" warp
+
+    # Nếu mode không phải proxy → KHÔNG connect, abort để tránh mất SSH
+    if "$WARP_BIN" settings 2>/dev/null | grep -qi 'Tunnel\b' \
+        && ! "$WARP_BIN" settings 2>/dev/null | grep -qi 'proxy'; then
+        echo -e "${C_ERR}  [!] WARP đang ở tunnel mode — KHÔNG connect để tránh mất SSH.${C_RST}"
+        echo "      Chạy thủ công: warp-cli set-mode proxy"
+        ACTIVE_PROXY=""; log "warp aborted: tunnel mode detected" warp; return 1
+    fi
+
     local conn_out
     conn_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect 2>&1 \
         | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
