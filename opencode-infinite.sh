@@ -254,6 +254,14 @@ warp_is_registered() {
     return 1
 }
 
+# Helper: chạy warp-cli, auto-accept ToS (pipe y vào stdin), redirect output vào log
+warp_cmd() {
+    # printf 'y\n' để trả lời ToS prompt nếu warp-cli hỏi
+    # </dev/null fallback phòng khi không có TTY
+    printf 'y\n' | timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" "$@" \
+        2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' | log_pipe warp || true
+}
+
 # Start WARP in proxy mode on PROXY_PORT
 warp_up() {
     PROXY_PORT=40000
@@ -262,26 +270,22 @@ warp_up() {
     # Tự động đăng ký nếu chưa có account
     if ! warp_is_registered; then
         echo "    WARP chưa đăng ký — đang tạo account mới..."
-        local reg_out
-        reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new --accept-tos 2>&1 \
-            | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
-        log "warp registration new: $reg_out" warp
+        warp_cmd registration new --accept-tos
         sleep 2
         if ! warp_is_registered; then
             echo -e "${C_ERR}  [!] WARP registration thất bại — falling back to NONE.${C_RST}"
-            echo "      Chi tiết: $reg_out"
             ACTIVE_PROXY=""; log "warp reg failed" warp; return 1
         fi
         echo "    WARP registered OK."
     fi
 
     echo "    Connecting WARP proxy on port $PROXY_PORT..."
-    "$WARP_BIN" disconnect 2>/dev/null | cat >/dev/null || true
+    warp_cmd disconnect
 
     # QUAN TRỌNG: phải set proxy mode TRƯỚC khi connect
     # Tunnel mode sẽ route toàn bộ traffic → mất SSH trên VPS
-    "$WARP_BIN" set-mode proxy 2>/dev/null || true
-    "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
+    warp_cmd set-mode proxy
+    warp_cmd set-proxy-port "$PROXY_PORT"
 
     # Xác nhận mode đã được set đúng trước khi connect
     local current_mode
@@ -298,10 +302,7 @@ warp_up() {
         ACTIVE_PROXY=""; log "warp aborted: tunnel mode detected" warp; return 1
     fi
 
-    local conn_out
-    conn_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect 2>&1 \
-        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
-    log "warp connect: $conn_out" warp
+    warp_cmd connect
     sleep "$WARP_WAIT"
     ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
 
@@ -317,21 +318,16 @@ warp_up() {
 
 warp_rotate() {
     log "warp_rotate: start" warp
-    # Toàn bộ output của warp-cli vào log, không ra stdout (tránh corruption terminal)
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" disconnect 2>&1 \
-        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' | log_pipe warp || true
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration delete 2>&1 \
-        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' | log_pipe warp || true
+    warp_cmd disconnect
+    warp_cmd registration delete
     sleep 2
-    local reg_out
-    reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new --accept-tos 2>&1 \
-        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
-    log "warp rotate reg: $reg_out" warp
+    warp_cmd registration new --accept-tos
+    log "warp rotate: registration done" warp
     sleep "$ROTATE_COOLDOWN"
     # PHẢI set proxy mode trước khi connect (tránh tunnel mode → mất SSH)
-    "$WARP_BIN" set-mode proxy 2>/dev/null || true
-    "$WARP_BIN" set-proxy-port 40000 2>/dev/null || true
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect 2>/dev/null || true
+    warp_cmd set-mode proxy
+    warp_cmd set-proxy-port 40000
+    warp_cmd connect
     sleep "$WARP_WAIT"
     log "warp rotated" warp
 }
