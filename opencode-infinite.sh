@@ -208,15 +208,40 @@ install_warp() {
     fi
 }
 
+# Kiểm tra WARP đã đăng ký chưa (account tồn tại)
+warp_is_registered() {
+    local status
+    status="$("$WARP_BIN" status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//')"
+    # Nếu output chứa "Registration Missing" hoặc không có "Account" → chưa đăng ký
+    echo "$status" | grep -qiE 'Registration Missing|Not Registered' && return 1
+    echo "$status" | grep -qiE 'Account|Connected|Connecting|Disconnected' && return 0
+    return 1
+}
+
 # Start WARP in proxy mode on PROXY_PORT
 warp_up() {
     PROXY_PORT=40000
+    echo "    Kiểm tra WARP registration..."
+
+    # Tự động đăng ký nếu chưa có account
+    if ! warp_is_registered; then
+        echo "    WARP chưa đăng ký — đang tạo account mới..."
+        local reg_out
+        reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
+        log "warp registration new: $reg_out" warp
+        sleep 2
+        if ! warp_is_registered; then
+            echo -e "${C_ERR}  [!] WARP registration thất bại — falling back to NONE.${C_RST}"
+            echo "      Chi tiết: $reg_out"
+            ACTIVE_PROXY=""; log "warp reg failed" warp; return 1
+        fi
+        echo "    WARP registered OK."
+    fi
+
     echo "    Connecting WARP proxy on port $PROXY_PORT..."
-    # strip ANSI / carriage returns from warp-cli output
-    local warp_out
-    "$WARP_BIN" disconnect 2>&1 | cat >/dev/null || true
-    warp_out="$("$WARP_BIN" set-mode proxy 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
-    log "warp set-mode proxy: $warp_out" warp
+    "$WARP_BIN" disconnect 2>/dev/null | cat >/dev/null || true
+    "$WARP_BIN" set-mode proxy 2>/dev/null || true
     "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
     local conn_out
     conn_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect 2>&1 \
@@ -224,24 +249,28 @@ warp_up() {
     log "warp connect: $conn_out" warp
     sleep "$WARP_WAIT"
     ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
+
     # verify proxy is actually listening
     if ! nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null; then
-        echo -e "${C_WARN}  [!] WARP proxy not listening on $PROXY_PORT — falling back to NONE.${C_RST}"
-        ACTIVE_PROXY=""
-        log "warp proxy not listening, fallback NONE" warp
-        return 1
+        echo -e "${C_WARN}  [!] WARP proxy không lắng nghe trên $PROXY_PORT — falling back to NONE.${C_RST}"
+        echo "      Thử chạy thủ công: warp-cli connect && warp-cli status"
+        ACTIVE_PROXY=""; log "warp proxy not listening" warp; return 1
     fi
-    echo "    WARP proxy up on $ACTIVE_PROXY"
+    echo -e "${C_OK}  WARP proxy up → $ACTIVE_PROXY${C_RST}"
     log "warp proxy up on $ACTIVE_PROXY" warp
 }
 
 warp_rotate() {
     echo "    Rotating WARP IP..."
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" disconnect >/dev/null 2>&1 || true
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration delete >/dev/null 2>&1 || true
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new >/dev/null 2>&1 || true
+    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" disconnect 2>/dev/null || true
+    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration delete 2>/dev/null || true
+    sleep 2
+    local reg_out
+    reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
+    log "warp rotate reg: $reg_out" warp
     sleep "$ROTATE_COOLDOWN"
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect >/dev/null 2>&1 || true
+    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect 2>/dev/null || true
     sleep "$WARP_WAIT"
     log "warp rotated" warp
 }
