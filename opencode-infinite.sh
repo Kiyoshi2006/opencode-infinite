@@ -217,21 +217,28 @@ install_warp() {
 }
 
 # Kiểm tra WARP đang ở tunnel mode khi đã connected (nguy hiểm trên VPS)
+# KHÔNG disconnect nếu tunnel mode — SSH đang đi qua WARP, disconnect = mất SSH
 warp_check_tunnel_danger() {
     [ -z "$WARP_BIN" ] && return 0
     local status settings
     status="$("$WARP_BIN" status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
-    # Chỉ cảnh báo nếu đang Connected (nếu Disconnected thì warp_up sẽ set proxy mode trước khi connect)
     if echo "$status" | grep -qi 'Connected'; then
         settings="$("$WARP_BIN" settings 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
         if echo "$settings" | grep -qi 'Tunnel' && ! echo "$settings" | grep -qi 'proxy'; then
-            echo -e "${C_WARN}  [warp] Tunnel mode detected — chuyển sang proxy mode...${C_RST}"
-            "$WARP_BIN" disconnect 2>/dev/null || true
-            "$WARP_BIN" set-mode proxy 2>/dev/null || true
-            sleep 2
-            log "warp startup: converted tunnel→proxy mode" warp
+            echo ""
+            echo -e "${C_ERR}  [!] WARP đang CONNECTED ở TUNNEL MODE!${C_RST}"
+            echo -e "${C_ERR}      Script KHÔNG thể tự fix — disconnect từ SSH sẽ mất SSH luôn.${C_RST}"
+            echo ""
+            echo "      Fix từ serial console (Oracle Cloud Console):"
+            echo "        warp-cli disconnect"
+            echo "        warp-cli set-mode proxy"
+            echo ""
+            echo "      Sau đó chạy lại script và làm theo hướng dẫn setup WARP."
+            log "warp tunnel mode detected — aborted, user must fix via serial console" warp
+            return 1
         fi
     fi
+    return 0
 }
 
 # Kiểm tra WARP đã đăng ký chưa (account tồn tại)
@@ -254,60 +261,56 @@ warp_cmd() {
     [ -n "$out" ] && log "warp_cmd $*: $out" warp
 }
 
-# Start WARP in proxy mode on PROXY_PORT
+# Kết nối WARP proxy mode (chỉ gọi khi đã qua warp_check_tunnel_danger)
 warp_up() {
     PROXY_PORT=40000
-    echo "    Kiểm tra WARP registration..."
+    ACTIVE_PROXY=""
 
-    # Tự động đăng ký nếu chưa có account
+    # Đăng ký nếu chưa có account
     if ! warp_is_registered; then
-        echo "    WARP chưa đăng ký — đang tạo account mới..."
+        echo "    WARP chưa đăng ký — đang tạo account..."
         warp_cmd registration new
         sleep 2
         if ! warp_is_registered; then
-            echo -e "${C_ERR}  [!] WARP registration thất bại — falling back to NONE.${C_RST}"
-            ACTIVE_PROXY=""; log "warp reg failed" warp; return 1
+            echo -e "${C_ERR}  [!] WARP registration thất bại.${C_RST}"
+            log "warp reg failed" warp; return 1
         fi
-        echo "    WARP registered OK."
     fi
 
-    echo "    Connecting WARP proxy on port $PROXY_PORT..."
-    warp_cmd disconnect
-    sleep 1
+    local status
+    status="$("$WARP_BIN" status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
 
-    # QUAN TRỌNG: phải set proxy mode TRƯỚC khi connect
-    # Tunnel mode sẽ route toàn bộ traffic → mất SSH trên VPS
-    "$WARP_BIN" set-mode proxy 2>/dev/null || true
-    sleep 1
-    "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
-    sleep 1
+    if echo "$status" | grep -qi 'Connected'; then
+        # Đã connected (proxy mode đã verify bởi warp_check_tunnel_danger)
+        echo "    WARP đã connected."
+    else
+        # Chưa connected → set proxy mode rồi connect
+        echo "    Thiết lập proxy mode..."
+        "$WARP_BIN" set-mode proxy 2>/dev/null || true
+        sleep 1
+        "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
+        sleep 1
+        echo "    Connecting WARP..."
+        warp_cmd connect
+        sleep "$WARP_WAIT"
 
-    # Xác nhận mode đã được set đúng trước khi connect
-    local current_mode
-    current_mode="$("$WARP_BIN" settings 2>/dev/null \
-        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' \
-        | grep -i 'mode\|proxy' | head -2 || echo "")"
-    log "warp mode check: $current_mode" warp
-    echo "    Mode: $current_mode"
-
-    # Nếu mode không phải proxy → KHÔNG connect, abort để tránh mất SSH
-    if "$WARP_BIN" settings 2>/dev/null | grep -qi 'Tunnel\b' \
-        && ! "$WARP_BIN" settings 2>/dev/null | grep -qi 'proxy'; then
-        echo -e "${C_ERR}  [!] WARP đang ở tunnel mode — KHÔNG connect để tránh mất SSH.${C_RST}"
-        echo "      Chạy thủ công: warp-cli set-mode proxy"
-        ACTIVE_PROXY=""; log "warp aborted: tunnel mode detected" warp; return 1
+        # Verify KHÔNG bị tunnel mode sau khi connect
+        local post_settings
+        post_settings="$("$WARP_BIN" settings 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
+        if echo "$post_settings" | grep -qi 'Tunnel' && ! echo "$post_settings" | grep -qi 'proxy'; then
+            echo -e "${C_ERR}  [!] WARP connected nhưng vẫn tunnel mode — DISCONNECT ngay!${C_RST}"
+            "$WARP_BIN" disconnect 2>/dev/null || true
+            log "warp post-connect tunnel mode: force disconnected" warp; return 1
+        fi
     fi
 
-    warp_cmd connect
-    sleep "$WARP_WAIT"
-    ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
-
-    # verify proxy is actually listening
+    # Verify proxy port listening
     if ! nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null; then
-        echo -e "${C_WARN}  [!] WARP proxy không lắng nghe trên $PROXY_PORT — falling back to NONE.${C_RST}"
-        echo "      Thử chạy thủ công: warp-cli connect && warp-cli status"
-        ACTIVE_PROXY=""; log "warp proxy not listening" warp; return 1
+        echo -e "${C_WARN}  [!] WARP proxy port $PROXY_PORT không listen — falling back NONE.${C_RST}"
+        ACTIVE_PROXY=""; log "warp proxy port not listening" warp; return 1
     fi
+
+    ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
     echo -e "${C_OK}  WARP proxy up → $ACTIVE_PROXY${C_RST}"
     log "warp proxy up on $ACTIVE_PROXY" warp
 }
@@ -952,7 +955,7 @@ egress_connect() {
             echo -e "${C_WARN}  [!] WARP not found — switching to NONE.${C_RST}"
             EGRESS=NONE; ACTIVE_PROXY=""; return 0
         fi
-        warp_check_tunnel_danger
+        warp_check_tunnel_danger || return 1
         warp_up
         get_ip "$ACTIVE_PROXY"
         echo "  IP: ${IP:-unknown}  WARP: ${WARP_FLAG:-?}"
