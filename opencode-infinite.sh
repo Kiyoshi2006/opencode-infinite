@@ -212,12 +212,26 @@ install_warp() {
 warp_up() {
     PROXY_PORT=40000
     echo "    Connecting WARP proxy on port $PROXY_PORT..."
-    "$WARP_BIN" disconnect >/dev/null 2>&1 || true
-    "$WARP_BIN" set-mode proxy >/dev/null 2>&1
-    "$WARP_BIN" set-proxy-port "$PROXY_PORT" >/dev/null 2>&1
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect >/dev/null 2>&1 || true
+    # strip ANSI / carriage returns from warp-cli output
+    local warp_out
+    "$WARP_BIN" disconnect 2>&1 | cat >/dev/null || true
+    warp_out="$("$WARP_BIN" set-mode proxy 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
+    log "warp set-mode proxy: $warp_out" warp
+    "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
+    local conn_out
+    conn_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
+    log "warp connect: $conn_out" warp
     sleep "$WARP_WAIT"
     ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
+    # verify proxy is actually listening
+    if ! nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null; then
+        echo -e "${C_WARN}  [!] WARP proxy not listening on $PROXY_PORT — falling back to NONE.${C_RST}"
+        ACTIVE_PROXY=""
+        log "warp proxy not listening, fallback NONE" warp
+        return 1
+    fi
+    echo "    WARP proxy up on $ACTIVE_PROXY"
     log "warp proxy up on $ACTIVE_PROXY" warp
 }
 
@@ -477,14 +491,15 @@ find_opencode() {
     OC_CMD=""
     OC_VER=""
     local candidates=()
-    if have_cmd opencode; then
-        candidates+=("$(command -v opencode)")
-    fi
-    # also check npm global bin
+    # Common install locations
+    have_cmd opencode && candidates+=("$(command -v opencode)")
+    [ -x "$HOME/.opencode/bin/opencode" ] && candidates+=("$HOME/.opencode/bin/opencode")
+    [ -x "$HOME/.local/bin/opencode"    ] && candidates+=("$HOME/.local/bin/opencode")
+    # npm global bin
     local npm_bin
     npm_bin="$(npm bin -g 2>/dev/null || echo "")"
     [ -n "$npm_bin" ] && [ -x "$npm_bin/opencode" ] && candidates+=("$npm_bin/opencode")
-    # find the newest by version
+    # pick first working candidate
     for c in "${candidates[@]:-}"; do
         local v; v="$("$c" --version 2>/dev/null | tr -d '[:space:]' || echo "")"
         if [ -n "$v" ]; then
@@ -625,9 +640,13 @@ watch_stop() {
 }
 
 scan_log() {
-    # Quick check: was a fatal line already in the log?
+    # Chỉ đọc log được ghi SAU khi OpenCode lần này bắt đầu chạy
     [ -f "$LOGFILE" ] || return 1
-    if tail -100 "$LOGFILE" 2>/dev/null | grep -qE "$OC_PAT"; then
+    local since="${LOG_RUN_TS:-0}"
+    # Lọc theo file modification time: chỉ xét nếu log được sửa gần đây
+    local log_mt; log_mt="$(stat -c %Y "$LOGFILE" 2>/dev/null || echo 0)"
+    [ "$log_mt" -lt "$since" ] && return 1
+    if tail -200 "$LOGFILE" 2>/dev/null | grep -qE "$OC_PAT"; then
         QHIT=1; return 0
     fi
     return 1
@@ -720,10 +739,12 @@ run_opencode() {
     echo "  Egress : $EGRESS${ACTIVE_PROXY:+  Proxy: $ACTIVE_PROXY}"
     echo ""
 
+    # Ghi timestamp trước khi chạy → scan_log chỉ đọc log SAU điểm này
+    LOG_RUN_TS="$(date '+%s')"
+
     local rc=0
     (cd "$OPFOLDER" && \
      env "${env_args[@]:-}" "$OC_CMD" \
-         ${COLD:+} \
          ${RESUME:+--continue} \
          $runargs) || rc=$?
 
@@ -739,11 +760,14 @@ auto_rotate_loop() {
     local runargs="${1:-}"
     local tries=0
 
-    # first connect egress
-    egress_connect || { echo -e "${C_ERR}  Could not connect egress.${C_RST}"; return 1; }
+    # Kết nối egress lần đầu (nếu chưa kết nối)
+    if [ "$WARP_UP" = "0" ] || [ -z "$ACTIVE_PROXY" -a "$EGRESS" != "NONE" ]; then
+        egress_connect || { echo -e "${C_ERR}  Could not connect egress.${C_RST}"
+            echo -n "  Press Enter to return to menu..."; read -r; return 1; }
+        WARP_UP=1
+    fi
 
     while true; do
-        COLD=0
         run_opencode "$runargs"
         local rc=$?
 
@@ -752,12 +776,27 @@ auto_rotate_loop() {
         local fatal="${FHIT:-}${QHIT:-}"
 
         if [ -z "$fatal" ] && [ "$rc" -eq 0 ]; then
-            # clean exit
+            # clean exit — hỏi user muốn làm gì
+            echo ""
+            echo -e "${C_OK}  OpenCode đã thoát.${C_RST}"
+            case "$ON_CLOSE" in
+            quit) break ;;
+            *)
+                echo "  [r] Mở lại  [m] Về menu  [q] Thoát"
+                echo -n "  Pick: "; read -r oc_ans
+                case "$oc_ans" in
+                r|R) continue ;;
+                q|Q) exit 0 ;;
+                *) break ;;
+                esac
+                ;;
+            esac
             break
         fi
 
         if [ "$AUTO_ROTATE" != "1" ]; then
             echo -e "${C_WARN}  [!] OpenCode exited (rc=$rc). Auto-rotate is off.${C_RST}"
+            echo -n "  Press Enter..."; read -r
             break
         fi
 
@@ -1015,33 +1054,40 @@ main() {
 
     # main loop
     while true; do
+        # Refresh IP display trước khi vẽ menu (chỉ khi đã có proxy)
+        if [ -n "$ACTIVE_PROXY" ] || [ "$EGRESS" = "NONE" ]; then
+            get_ip "$ACTIVE_PROXY" 2>/dev/null || true
+        fi
         show_menu
         read -r choice
+        echo ""
         case "$choice" in
         1)
-            # Fresh start: rotate egress, then open
-            COLD=1; RESUME=""
-            if [ "$EGRESS" != "NONE" ] && [ "$WARP_UP" = "1" ]; then
-                rotate "menu"
+            # Fresh start: kết nối / xoay egress rồi mở
+            RESUME=""
+            clear
+            if [ "$WARP_UP" = "1" ] && [ "$EGRESS" = "WARP" ]; then
+                rotate "fresh"
             fi
             auto_rotate_loop
             ;;
         2)
-            # Continue: same egress
-            COLD=0; RESUME=1
+            # Continue: egress cũ, nối tiếp chat
+            RESUME=1
+            clear
             auto_rotate_loop
             ;;
         3)
             # Change IP only
-            rotate "menu"
-            get_ip "$ACTIVE_PROXY"
-            echo "  New IP: ${IP:-unknown}"
-            sleep 1
+            clear
+            rotate "menu" && get_ip "$ACTIVE_PROXY" && echo "  New IP: ${IP:-unknown}"
+            echo ""
+            echo -n "  Press Enter to continue..."; read -r
             ;;
         4) folder_menu ;;
         5) deep_reset ;;
-        7) token_reset; COLD=1; RESUME=""; auto_rotate_loop ;;
-        8) settings_menu ;;
+        7) token_reset; RESUME=""; clear; auto_rotate_loop ;;
+        8) settings_menu; WARP_UP=0; ACTIVE_PROXY="" ;;
         q|Q) break ;;
         *) ;;
         esac
