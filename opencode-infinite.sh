@@ -127,11 +127,17 @@ lock_check() {
     mkdir -p "$STATE_DIR"
     if [ -f "$LOCK_FILE" ]; then
         local pid; pid="$(cat "$LOCK_FILE" 2>/dev/null || echo 0)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            echo -e "${C_WARN}[!] Another instance is already running (PID $pid).${C_RST}"
-            echo "    Close it or delete $LOCK_FILE to continue."
-            exit 1
+        # PID còn sống VÀ đúng là process opencode-infinite (không phải PID tái sử dụng)
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+            local cmdline; cmdline="$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' || echo '')"
+            if echo "$cmdline" | grep -q "opencode-infinite"; then
+                echo -e "${C_WARN}[!] Another instance is already running (PID $pid).${C_RST}"
+                echo "    Close it or delete $LOCK_FILE to continue."
+                exit 1
+            fi
         fi
+        # Stale lock (process đã chết hoặc PID bị tái sử dụng) — xóa và tiếp tục
+        rm -f "$LOCK_FILE"
     fi
     echo "$$" > "$LOCK_FILE"
 }
