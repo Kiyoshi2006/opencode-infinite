@@ -270,7 +270,7 @@ warp_up() {
     # Tự động đăng ký nếu chưa có account
     if ! warp_is_registered; then
         echo "    WARP chưa đăng ký — đang tạo account mới..."
-        warp_cmd registration new --accept-tos
+        warp_cmd registration new
         sleep 2
         if ! warp_is_registered; then
             echo -e "${C_ERR}  [!] WARP registration thất bại — falling back to NONE.${C_RST}"
@@ -321,7 +321,7 @@ warp_rotate() {
     warp_cmd disconnect
     warp_cmd registration delete
     sleep 2
-    warp_cmd registration new --accept-tos
+    warp_cmd registration new
     log "warp rotate: registration done" warp
     sleep "$ROTATE_COOLDOWN"
     # PHẢI set proxy mode trước khi connect (tránh tunnel mode → mất SSH)
