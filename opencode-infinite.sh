@@ -231,7 +231,7 @@ warp_check_tunnel_danger() {
             echo ""
             echo "      Fix từ serial console (Oracle Cloud Console):"
             echo "        warp-cli disconnect"
-            echo "        warp-cli set-mode proxy"
+            echo "        warp-cli mode proxy"
             echo ""
             echo "      Sau đó chạy lại script và làm theo hướng dẫn setup WARP."
             log "warp tunnel mode detected — aborted, user must fix via serial console" warp
@@ -269,7 +269,7 @@ warp_up() {
     # Đăng ký nếu chưa có account
     if ! warp_is_registered; then
         echo "    WARP chưa đăng ký — đang tạo account..."
-        warp_cmd registration new
+        warp_cmd --accept-tos registration new
         sleep 2
         if ! warp_is_registered; then
             echo -e "${C_ERR}  [!] WARP registration thất bại.${C_RST}"
@@ -286,9 +286,9 @@ warp_up() {
     else
         # Chưa connected → set proxy mode rồi connect
         echo "    Thiết lập proxy mode..."
-        "$WARP_BIN" set-mode proxy 2>/dev/null || true
+        "$WARP_BIN" mode proxy 2>/dev/null || true
         sleep 1
-        "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
+        "$WARP_BIN" proxy port "$PROXY_PORT" 2>/dev/null || true
         sleep 1
         echo "    Connecting WARP..."
         warp_cmd connect
@@ -320,12 +320,12 @@ warp_rotate() {
     warp_cmd disconnect
     warp_cmd registration delete
     sleep 2
-    warp_cmd registration new
+    warp_cmd --accept-tos registration new
     log "warp rotate: registration done" warp
     sleep "$ROTATE_COOLDOWN"
     # PHẢI set proxy mode trước khi connect (tránh tunnel mode → mất SSH)
-    warp_cmd set-mode proxy
-    warp_cmd set-proxy-port 40000
+    warp_cmd mode proxy
+    warp_cmd proxy port 40000
     warp_cmd connect
     sleep "$WARP_WAIT"
     log "warp rotated" warp
