@@ -109,6 +109,14 @@ log() {
     echo "[$ts] [$tag] $msg" >> "$LAUNCHER_LOG" 2>/dev/null || true
 }
 
+# Đọc stdin và ghi từng dòng vào log (dùng để pipe output warp-cli vào log)
+log_pipe() {
+    local tag="${1:-info}"
+    while IFS= read -r line; do
+        [ -n "$line" ] && log "$line" "$tag"
+    done
+}
+
 trim_log() {
     local f="$1" max_kb="${2:-1024}"
     [ -f "$f" ] || return
@@ -255,7 +263,7 @@ warp_up() {
     if ! warp_is_registered; then
         echo "    WARP chưa đăng ký — đang tạo account mới..."
         local reg_out
-        reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new 2>&1 \
+        reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new --accept-tos 2>&1 \
             | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
         log "warp registration new: $reg_out" warp
         sleep 2
@@ -308,12 +316,15 @@ warp_up() {
 }
 
 warp_rotate() {
-    echo "    Rotating WARP IP..."
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" disconnect 2>/dev/null || true
-    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration delete 2>/dev/null || true
+    log "warp_rotate: start" warp
+    # Toàn bộ output của warp-cli vào log, không ra stdout (tránh corruption terminal)
+    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" disconnect 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' | log_pipe warp || true
+    timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration delete 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g; s/\r//' | log_pipe warp || true
     sleep 2
     local reg_out
-    reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new 2>&1 \
+    reg_out="$(timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" registration new --accept-tos 2>&1 \
         | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
     log "warp rotate reg: $reg_out" warp
     sleep "$ROTATE_COOLDOWN"
@@ -627,8 +638,17 @@ oc_update_check() {
         echo -n "        Update now? [Y/n]: "
         read -r ans
         if [[ "$ans" =~ ^[Yy]$|^$ ]]; then
-            npm install -g @opencode/cli 2>&1 | tail -3
-            find_opencode
+            if ! have_cmd npm; then
+                echo "  npm chưa có — đang cài Node.js (nodesource LTS)..."
+                curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - >/dev/null 2>&1
+                sudo apt-get install -y nodejs >/dev/null 2>&1
+            fi
+            if have_cmd npm; then
+                npm install -g @opencode/cli 2>&1 | tail -3
+                find_opencode
+            else
+                echo -e "${C_ERR}  [!] Không cài được npm, bỏ qua update.${C_RST}"
+            fi
         fi
     fi
 }
@@ -717,8 +737,9 @@ watch_start() {
     [ -z "$LOGFILE" ] && return 0
     QHIT=""; FHIT=""
     # tail the opencode log and signal ourselves when a fatal line appears
+    # -n 0 = chỉ đọc log MỚI, bỏ qua nội dung cũ từ session trước
     (
-        tail -F "$LOGFILE" 2>/dev/null | \
+        tail -F -n 0 "$LOGFILE" 2>/dev/null | \
         grep -m1 --line-buffered -E "$OC_PAT" >/dev/null 2>&1
         # Send SIGUSR1 to the parent launcher
         kill -USR1 $$ 2>/dev/null || true
