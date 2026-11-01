@@ -208,6 +208,34 @@ install_warp() {
     fi
 }
 
+# Kiểm tra WARP đang ở tunnel mode khi đã connected (nguy hiểm trên VPS)
+warp_check_tunnel_danger() {
+    [ -z "$WARP_BIN" ] && return 0
+    local status settings
+    status="$("$WARP_BIN" status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
+    # Chỉ cảnh báo nếu đang Connected (nếu Disconnected thì warp_up sẽ set proxy mode trước khi connect)
+    if echo "$status" | grep -qi 'Connected'; then
+        settings="$("$WARP_BIN" settings 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
+        if echo "$settings" | grep -qi 'Tunnel' && ! echo "$settings" | grep -qi 'proxy'; then
+            echo ""
+            echo -e "${C_ERR}╔══════════════════════════════════════════════════════════╗${C_RST}"
+            echo -e "${C_ERR}║  CẢNH BÁO: WARP đang CONNECTED ở TUNNEL MODE!           ║${C_RST}"
+            echo -e "${C_ERR}║  Nếu bạn đang dùng SSH/VPS → SSH có thể bị mất ngay!   ║${C_RST}"
+            echo -e "${C_ERR}╚══════════════════════════════════════════════════════════╝${C_RST}"
+            echo ""
+            echo "  Script sẽ tự chuyển sang proxy mode và reconnect WARP."
+            echo "  Nếu SSH bị đứt trong quá trình này — đó là bình thường,"
+            echo "  reconnect lại sau 10 giây."
+            echo ""
+            read -r -t 10 -p "  Nhấn Enter để tiếp tục, hoặc Ctrl+C để huỷ..." || true
+            "$WARP_BIN" disconnect 2>/dev/null || true
+            "$WARP_BIN" set-mode proxy 2>/dev/null || true
+            sleep 2
+            log "warp startup: converted tunnel→proxy mode" warp
+        fi
+    fi
+}
+
 # Kiểm tra WARP đã đăng ký chưa (account tồn tại)
 warp_is_registered() {
     local status
@@ -289,6 +317,9 @@ warp_rotate() {
         | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
     log "warp rotate reg: $reg_out" warp
     sleep "$ROTATE_COOLDOWN"
+    # PHẢI set proxy mode trước khi connect (tránh tunnel mode → mất SSH)
+    "$WARP_BIN" set-mode proxy 2>/dev/null || true
+    "$WARP_BIN" set-proxy-port 40000 2>/dev/null || true
     timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" connect 2>/dev/null || true
     sleep "$WARP_WAIT"
     log "warp rotated" warp
@@ -908,6 +939,7 @@ egress_connect() {
             echo -e "${C_WARN}  [!] WARP not found — switching to NONE.${C_RST}"
             EGRESS=NONE; ACTIVE_PROXY=""; return 0
         fi
+        warp_check_tunnel_danger
         warp_up
         get_ip "$ACTIVE_PROXY"
         echo "  IP: ${IP:-unknown}  WARP: ${WARP_FLAG:-?}"
