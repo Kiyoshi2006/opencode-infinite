@@ -501,9 +501,12 @@ find_opencode() {
     [ -n "$npm_bin" ] && [ -x "$npm_bin/opencode" ] && candidates+=("$npm_bin/opencode")
     # pick first working candidate
     for c in "${candidates[@]:-}"; do
-        local v; v="$("$c" --version 2>/dev/null | tr -d '[:space:]' || echo "")"
-        if [ -n "$v" ]; then
-            OC_CMD="$c"; OC_VER="$v"
+        local raw; raw="$("$c" --version 2>/dev/null | tr -d '[:space:]' || echo "")"
+        if [ -n "$raw" ]; then
+            OC_CMD="$c"
+            # Strip prefix như "opencodev" → chỉ giữ "2.2.5"
+            OC_VER="$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)"
+            [ -z "$OC_VER" ] && OC_VER="$raw"
             break
         fi
     done
@@ -576,6 +579,22 @@ self_update() {
 }
 
 # ---------------------------------------------------------------
+# HELPER: chạy lệnh với proxy nếu có, không dùng env array rỗng
+# ---------------------------------------------------------------
+run_cmd_proxy() {
+    # run_cmd_proxy <proxy_url> <cmd> [args...]
+    local proxy="$1"; shift
+    if [ -n "$proxy" ]; then
+        HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" \
+        http_proxy="$proxy" https_proxy="$proxy" \
+        NO_PROXY="$NO_PROXY_LIST" no_proxy="$NO_PROXY_LIST" \
+        "$@"
+    else
+        "$@"
+    fi
+}
+
+# ---------------------------------------------------------------
 # PROBE  (cheap message to test an IP)
 # ---------------------------------------------------------------
 probe_ip() {
@@ -588,14 +607,14 @@ probe_ip() {
     fi
     local probe_id="ses_probe0000000"
     local out
-    out="$(env "${env_args[@]:-}" timeout 30 \
+    out="$(run_cmd_proxy "$proxy" timeout 30 \
         "$OC_CMD" run --session "$probe_id" \
         ${CAP_STANDALONE:+--standalone} \
         --model "$PROBE_MODEL" \
         "ping" 2>&1 || echo "PROBEFAIL")"
 
     # delete probe session
-    env "${env_args[@]:-}" "$OC_CMD" session delete "$probe_id" >/dev/null 2>&1 || true
+    run_cmd_proxy "$proxy" "$OC_CMD" session delete "$probe_id" >/dev/null 2>&1 || true
 
     if echo "$out" | grep -qiE 'limit|quota|credits|rate.?limit|payment'; then
         log "probe: IP burned (limit response)" probe
@@ -696,14 +715,8 @@ rotate() {
 resume_chat() {
     log "resume start" resume
     echo -e "${C_CYAN}  [resume] Sending: $RESUME_MSG${C_RST}"
-    local env_args=()
-    if [ -n "$ACTIVE_PROXY" ]; then
-        env_args+=("HTTP_PROXY=$ACTIVE_PROXY" "HTTPS_PROXY=$ACTIVE_PROXY" \
-                   "http_proxy=$ACTIVE_PROXY" "https_proxy=$ACTIVE_PROXY" \
-                   "NO_PROXY=$NO_PROXY_LIST" "no_proxy=$NO_PROXY_LIST")
-    fi
     local rc=0
-    env "${env_args[@]:-}" timeout "$RESUME_TIMEOUT" \
+    run_cmd_proxy "$ACTIVE_PROXY" timeout "$RESUME_TIMEOUT" \
         "$OC_CMD" run \
         ${CAP_STANDALONE:+--standalone} \
         ${RESUME_AUTO:+--auto-approve} \
@@ -724,13 +737,6 @@ run_opencode() {
     local runargs="${1:-}"
     QHIT=""; FHIT=""
 
-    local env_args=()
-    if [ -n "$ACTIVE_PROXY" ]; then
-        env_args+=("HTTP_PROXY=$ACTIVE_PROXY" "HTTPS_PROXY=$ACTIVE_PROXY" \
-                   "http_proxy=$ACTIVE_PROXY" "https_proxy=$ACTIVE_PROXY" \
-                   "NO_PROXY=$NO_PROXY_LIST" "no_proxy=$NO_PROXY_LIST")
-    fi
-
     watch_start
 
     echo ""
@@ -743,8 +749,9 @@ run_opencode() {
     LOG_RUN_TS="$(date '+%s')"
 
     local rc=0
+    # shellcheck disable=SC2086
     (cd "$OPFOLDER" && \
-     env "${env_args[@]:-}" "$OC_CMD" \
+     run_cmd_proxy "$ACTIVE_PROXY" "$OC_CMD" \
          ${RESUME:+--continue} \
          $runargs) || rc=$?
 
