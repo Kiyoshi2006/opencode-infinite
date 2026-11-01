@@ -225,17 +225,7 @@ warp_check_tunnel_danger() {
     if echo "$status" | grep -qi 'Connected'; then
         settings="$("$WARP_BIN" settings 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
         if echo "$settings" | grep -qi 'Tunnel' && ! echo "$settings" | grep -qi 'proxy'; then
-            echo ""
-            echo -e "${C_ERR}╔══════════════════════════════════════════════════════════╗${C_RST}"
-            echo -e "${C_ERR}║  CẢNH BÁO: WARP đang CONNECTED ở TUNNEL MODE!           ║${C_RST}"
-            echo -e "${C_ERR}║  Nếu bạn đang dùng SSH/VPS → SSH có thể bị mất ngay!   ║${C_RST}"
-            echo -e "${C_ERR}╚══════════════════════════════════════════════════════════╝${C_RST}"
-            echo ""
-            echo "  Script sẽ tự chuyển sang proxy mode và reconnect WARP."
-            echo "  Nếu SSH bị đứt trong quá trình này — đó là bình thường,"
-            echo "  reconnect lại sau 10 giây."
-            echo ""
-            read -r -t 10 -p "  Nhấn Enter để tiếp tục, hoặc Ctrl+C để huỷ..." || true
+            echo -e "${C_WARN}  [warp] Tunnel mode detected — chuyển sang proxy mode...${C_RST}"
             "$WARP_BIN" disconnect 2>/dev/null || true
             "$WARP_BIN" set-mode proxy 2>/dev/null || true
             sleep 2
@@ -256,19 +246,11 @@ warp_is_registered() {
 
 # Helper: chạy warp-cli, auto-accept ToS (pipe y vào stdin), redirect output vào log
 warp_cmd() {
-    # warp-cli ghi ToS prompt ra /dev/tty trực tiếp (bypass stdout/stderr)
-    # Dùng 'script' để tạo pseudo-TTY, redirect /dev/tty của subprocess sang pipe
-    # Kết quả vào log, không ra stdout (tránh terminal corruption)
+    # Chạy warp-cli, redirect stdout/stderr vào log (không ra terminal)
+    # printf 'y\n' chỉ cần cho 'registration new' (ToS prompt đọc stdin)
     local out
-    if have_cmd script; then
-        # script -q -c "..." /dev/null: chạy trong pseudo-TTY, output capture được
-        out="$(printf 'y\n' | script -q -c \
-            "timeout $WARP_CALL_TIMEOUT $(printf '%q ' "$WARP_BIN" "$@")" \
-            /dev/null 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//g' || true)"
-    else
-        out="$(printf 'y\n' | timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" "$@" \
-            2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
-    fi
+    out="$(printf 'y\n' | timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" "$@" \
+        2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
     [ -n "$out" ] && log "warp_cmd $*: $out" warp
 }
 
@@ -291,11 +273,14 @@ warp_up() {
 
     echo "    Connecting WARP proxy on port $PROXY_PORT..."
     warp_cmd disconnect
+    sleep 1
 
     # QUAN TRỌNG: phải set proxy mode TRƯỚC khi connect
     # Tunnel mode sẽ route toàn bộ traffic → mất SSH trên VPS
-    warp_cmd set-mode proxy
-    warp_cmd set-proxy-port "$PROXY_PORT"
+    "$WARP_BIN" set-mode proxy 2>/dev/null || true
+    sleep 1
+    "$WARP_BIN" set-proxy-port "$PROXY_PORT" 2>/dev/null || true
+    sleep 1
 
     # Xác nhận mode đã được set đúng trước khi connect
     local current_mode
@@ -303,6 +288,7 @@ warp_up() {
         | sed 's/\x1b\[[0-9;]*m//g; s/\r//' \
         | grep -i 'mode\|proxy' | head -2 || echo "")"
     log "warp mode check: $current_mode" warp
+    echo "    Mode: $current_mode"
 
     # Nếu mode không phải proxy → KHÔNG connect, abort để tránh mất SSH
     if "$WARP_BIN" settings 2>/dev/null | grep -qi 'Tunnel\b' \
