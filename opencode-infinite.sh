@@ -335,8 +335,23 @@ warp_up() {
             ACTIVE_PROXY=""; return 1
         fi
     fi
+    wait_warp_ready "$ACTIVE_PROXY" || true
     echo -e "${C_OK}  WARP proxy up → $ACTIVE_PROXY${C_RST}"
     log "warp proxy up on $ACTIVE_PROXY" warp
+}
+
+# Chờ proxy thật sự ra Cloudflare (warp=on) trước khi mở OpenCode — tránh 502/ECONNRESET
+# khi tunnel vừa (re)connect còn "unstable".
+wait_warp_ready() {
+    local proxy="${1:-}" i t
+    [ -z "$proxy" ] && return 0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        t="$(curl -s --max-time 6 --proxy "$proxy" "$TRACE_URL" 2>/dev/null || true)"
+        if echo "$t" | grep -qE '^warp=(on|plus)'; then return 0; fi
+        sleep 2
+    done
+    echo -e "${C_WARN}  [!] Tunnel WARP chưa ổn định sau 20s — vẫn tiếp tục.${C_RST}"
+    return 1
 }
 
 warp_rotate() {
@@ -854,6 +869,7 @@ rotate() {
         fi
         warp_rotate
         sleep "$ROTATE_COOLDOWN"
+        wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
         echo "    New IP: ${IP:-unknown}"
         ;;
@@ -1260,12 +1276,16 @@ main() {
         echo ""
         case "$choice" in
         1)
-            # Fresh start: kết nối / xoay egress rồi mở
+            # Fresh start = [3] đổi IP + [7] reset token, rồi mở OpenCode
             RESUME=""
             clear
-            if [ "$WARP_UP" = "1" ] && [ "$EGRESS" = "WARP" ]; then
-                rotate "fresh"
+            if [ "$EGRESS" != "NONE" ]; then
+                if [ "$WARP_UP" != "1" ]; then
+                    egress_connect && WARP_UP=1
+                fi
+                rotate "fresh" || true
             fi
+            token_reset quiet
             auto_rotate_loop
             ;;
         2)
