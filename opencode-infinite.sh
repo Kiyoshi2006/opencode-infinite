@@ -169,7 +169,8 @@ cleanup() {
         kill "$OURBRIDGE" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 # ---------------------------------------------------------------
 # DEPENDENCY HELPERS
@@ -765,30 +766,37 @@ probe_ip() {
 # ---------------------------------------------------------------
 watch_pid=""
 
+FATAL_FLAG="$STATE_DIR/fatal.flag"
+
 watch_start() {
     [ "$WATCH" = "1" ] || return 0
     [ -z "$LOGFILE" ] && return 0
     QHIT=""; FHIT=""
-    # tail the opencode log and signal ourselves when a fatal line appears
-    # -n 0 = chỉ đọc log MỚI, bỏ qua nội dung cũ từ session trước
+    rm -f "$FATAL_FLAG"
+    mkdir -p "$STATE_DIR"
+    # Theo dõi log MỚI (-n 0). Khi thấy dòng limit: đánh dấu rồi tự đóng OpenCode
+    # → vòng lặp chính tự xoay IP + xoá token + resume. Không cần bấm Ctrl+C.
     (
         tail -F -n 0 "$LOGFILE" 2>/dev/null | \
         grep -m1 --line-buffered -E "$OC_PAT" >/dev/null 2>&1
-        # Send SIGUSR1 to the parent launcher
-        kill -USR1 $$ 2>/dev/null || true
+        touch "$FATAL_FLAG"
+        sleep 3                       # cho OpenCode kịp ghi/hiển thị lỗi
+        pkill -TERM -x opencode 2>/dev/null || true
+        sleep 5
+        pkill -KILL -x opencode 2>/dev/null || true
     ) &
     watch_pid=$!
-    # On fatal log line, set FHIT
-    trap 'FHIT=1' USR1
     log "watcher started pid=$watch_pid" watch
 }
 
 watch_stop() {
-    trap - USR1
-    if [ -n "$watch_pid" ] && kill -0 "$watch_pid" 2>/dev/null; then
+    if [ -n "${watch_pid:-}" ]; then
+        pkill -P "$watch_pid" 2>/dev/null || true   # tail + grep con
         kill "$watch_pid" 2>/dev/null || true
+        wait "$watch_pid" 2>/dev/null || true
     fi
     watch_pid=""
+    if [ -f "$FATAL_FLAG" ]; then FHIT=1; rm -f "$FATAL_FLAG"; fi
 }
 
 scan_log() {
@@ -882,12 +890,14 @@ run_opencode() {
     LOG_RUN_TS="$(date '+%s')"
 
     local rc=0
+    trap : INT
     # shellcheck disable=SC2086
     (cd "$OPFOLDER" && \
      run_cmd_proxy "$ACTIVE_PROXY" "$OC_CMD" \
          ${RESUME:+--continue} \
          $runargs) || rc=$?
 
+    trap 'exit 130' INT
     watch_stop
     log "opencode exited rc=$rc fhit=$FHIT qhit=$QHIT" run
     return $rc
