@@ -23,6 +23,7 @@ IP_FIND_MAX=0               # 0 = hunt forever until a clean IP found
 WARP_WAIT=6                 # seconds after (re)connecting WARP
 ROTATE_COOLDOWN=10          # seconds between rotate attempts
 AUTO_ROTATE=1               # 1 = auto-rotate on fatal log lines
+WARP_USE_BRIDGE=0          # 0 = dùng HTTP-proxy của WARP (:40000) như bản chạy tốt; 1 = ép qua bridge SOCKS5
 TOKEN_RESET_ON_LIMIT=1      # 1 = khi dính limit: xoay IP + xoá token (giữ chat) = gộp [7]+[1]
 WARP_CALL_TIMEOUT=15        # seconds a single warp-cli call may take
 WATCH=1                     # 1 = watch the log, rotate on fatal error
@@ -30,7 +31,7 @@ RESUME_MSG="continue"       # message sent to resume the chat
 RESUME_AUTO=1               # 1 = auto-approve tool permissions on resume
 RESUME_TIMEOUT=90           # seconds the resume may run before killed
 PROBE_MODEL="opencode/deepseek-v4.1-flash-free"
-PROBE=1                     # 1 = probe each IP before accepting it
+PROBE=0                     # 1 = gửi 1 tin thử cho mỗi IP mới (mặc định tắt: chuỗi [3]+[7] đã chạy tốt không cần)
 PROBE_BROKEN_MAX=3          # non-limit probe failures before giving up
 UPDATE_CHECK=0              # 1 = check GitHub for newer launcher on start
 LOG_ENABLED=1               # 1 = write to launcher.log
@@ -312,23 +313,27 @@ warp_up() {
         ACTIVE_PROXY=""; log "warp proxy port not listening" warp; return 1
     fi
 
-    # WARP proxy mode là SOCKS5. Luôn đi qua bridge HTTP→SOCKS5 của launcher (đã kiểm chứng),
-    # không dùng HTTP-proxy tích hợp của WARP (có thể trả 502 với CONNECT).
+    # Ưu tiên HTTP-proxy của WARP (:40000) — đường đã chạy ổn. Bridge SOCKS5 chỉ là dự phòng
+    # (hoặc khi WARP_USE_BRIDGE=1).
     local t
-    t="$(curl -s --max-time 10 --proxy "socks5h://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
-    if echo "$t" | grep -qE '^warp=(on|plus)'; then
-        WARP_HTTP_PORT=40001
-        start_http_bridge "$WARP_HTTP_PORT" "$PROXY_PORT" || { ACTIVE_PROXY=""; return 1; }
-        ACTIVE_PROXY="http://127.0.0.1:$WARP_HTTP_PORT"
-        # kiểm tra đường đi thật tới API của OpenCode qua bridge
-        local code
-        code="$(curl -s -o /dev/null -m 12 -w '%{http_code}' --proxy "$ACTIVE_PROXY" https://opencode.ai/ 2>/dev/null || echo 000)"
-        log "warp bridge test opencode.ai http=$code" warp
-        echo "    Test opencode.ai qua bridge: HTTP $code"
-    else
-        echo -e "${C_ERR}  [!] Traffic qua WARP proxy KHÔNG ra Cloudflare (warp!=on) — không dùng WARP.${C_RST}"
-        log "warp trace failed: $t" warp
-        ACTIVE_PROXY=""; return 1
+    ACTIVE_PROXY=""
+    if [ "$WARP_USE_BRIDGE" != "1" ]; then
+        t="$(curl -s --max-time 10 --proxy "http://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
+        if echo "$t" | grep -qE '^warp=(on|plus)'; then
+            ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
+        fi
+    fi
+    if [ -z "$ACTIVE_PROXY" ]; then
+        t="$(curl -s --max-time 10 --proxy "socks5h://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
+        if echo "$t" | grep -qE '^warp=(on|plus)'; then
+            WARP_HTTP_PORT=40001
+            start_http_bridge "$WARP_HTTP_PORT" "$PROXY_PORT" || { ACTIVE_PROXY=""; return 1; }
+            ACTIVE_PROXY="http://127.0.0.1:$WARP_HTTP_PORT"
+        else
+            echo -e "${C_ERR}  [!] Traffic qua WARP proxy KHÔNG ra Cloudflare (warp!=on) — không dùng WARP.${C_RST}"
+            log "warp trace failed: $t" warp
+            ACTIVE_PROXY=""; return 1
+        fi
     fi
     echo -e "${C_OK}  WARP proxy up → $ACTIVE_PROXY${C_RST}"
     log "warp proxy up on $ACTIVE_PROXY" warp
@@ -1007,6 +1012,7 @@ auto_rotate_loop() {
                     burned=$(( burned + 1 ))
                     echo -e "${C_WARN}  IP burned — rotating again...${C_RST}"
                     rotate "extra"
+                    [ "$TOKEN_RESET_ON_LIMIT" = "1" ] && token_reset quiet
                 elif [ "$pr" -eq 2 ]; then
                     # non-limit failure
                     PROBE_BROKEN_MAX=$(( PROBE_BROKEN_MAX - 1 ))
