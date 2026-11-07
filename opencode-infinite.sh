@@ -312,22 +312,23 @@ warp_up() {
         ACTIVE_PROXY=""; log "warp proxy port not listening" warp; return 1
     fi
 
-    # WARP proxy mode là SOCKS5. Kiểm tra thật: traffic qua proxy có ra Cloudflare (warp=on) không
+    # WARP proxy mode là SOCKS5. Luôn đi qua bridge HTTP→SOCKS5 của launcher (đã kiểm chứng),
+    # không dùng HTTP-proxy tích hợp của WARP (có thể trả 502 với CONNECT).
     local t
-    t="$(curl -s --max-time 10 --proxy "http://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
+    t="$(curl -s --max-time 10 --proxy "socks5h://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
     if echo "$t" | grep -qE '^warp=(on|plus)'; then
-        ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
+        WARP_HTTP_PORT=40001
+        start_http_bridge "$WARP_HTTP_PORT" "$PROXY_PORT" || { ACTIVE_PROXY=""; return 1; }
+        ACTIVE_PROXY="http://127.0.0.1:$WARP_HTTP_PORT"
+        # kiểm tra đường đi thật tới API của OpenCode qua bridge
+        local code
+        code="$(curl -s -o /dev/null -m 12 -w '%{http_code}' --proxy "$ACTIVE_PROXY" https://opencode.ai/ 2>/dev/null || echo 000)"
+        log "warp bridge test opencode.ai http=$code" warp
+        echo "    Test opencode.ai qua bridge: HTTP $code"
     else
-        t="$(curl -s --max-time 10 --proxy "socks5h://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
-        if echo "$t" | grep -qE '^warp=(on|plus)'; then
-            WARP_HTTP_PORT=40001
-            start_http_bridge "$WARP_HTTP_PORT" "$PROXY_PORT" || { ACTIVE_PROXY=""; return 1; }
-            ACTIVE_PROXY="http://127.0.0.1:$WARP_HTTP_PORT"
-        else
-            echo -e "${C_ERR}  [!] Traffic qua WARP proxy KHÔNG ra Cloudflare (warp!=on) — không dùng WARP.${C_RST}"
-            log "warp trace failed: $t" warp
-            ACTIVE_PROXY=""; return 1
-        fi
+        echo -e "${C_ERR}  [!] Traffic qua WARP proxy KHÔNG ra Cloudflare (warp!=on) — không dùng WARP.${C_RST}"
+        log "warp trace failed: $t" warp
+        ACTIVE_PROXY=""; return 1
     fi
     echo -e "${C_OK}  WARP proxy up → $ACTIVE_PROXY${C_RST}"
     log "warp proxy up on $ACTIVE_PROXY" warp
@@ -469,8 +470,8 @@ def handle(client):
             lines[0] = (method + ' /' + path + ' ' + line.split()[2]).encode('latin1')
             remote.sendall(b'\r\n'.join(lines) + b'\r\n\r\n' + rest)
         pipe(client, remote)
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write('bridge error: %r\n' % (e,)); sys.stderr.flush()
     finally:
         for x in (remote, client):
             try:
@@ -486,7 +487,7 @@ while True:
     c, _ = srv.accept()
     threading.Thread(target=handle, args=(c,), daemon=True).start()
 PYEOF
-    python3 "$bf" "$http_port" "$socks_port" >/dev/null 2>&1 &   # cmdline: http2socks.py <http> <socks>
+    python3 "$bf" "$http_port" "$socks_port" >/dev/null 2>>"$STATE_DIR/bridge.log" &   # cmdline: http2socks.py <http> <socks>
     OURBRIDGE=$!
     disown "$OURBRIDGE" 2>/dev/null || true
     log "http bridge pid=$OURBRIDGE http=$http_port socks=$socks_port" bridge
