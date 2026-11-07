@@ -23,6 +23,7 @@ IP_FIND_MAX=0               # 0 = hunt forever until a clean IP found
 WARP_WAIT=6                 # seconds after (re)connecting WARP
 ROTATE_COOLDOWN=10          # seconds between rotate attempts
 AUTO_ROTATE=1               # 1 = auto-rotate on fatal log lines
+TOKEN_RESET_ON_LIMIT=1      # 1 = khi dính limit: xoay IP + xoá token (giữ chat) = gộp [7]+[1]
 WARP_CALL_TIMEOUT=15        # seconds a single warp-cli call may take
 WATCH=1                     # 1 = watch the log, rotate on fatal error
 RESUME_MSG="continue"       # message sent to resume the chat
@@ -953,6 +954,12 @@ auto_rotate_loop() {
             break
         fi
 
+        # gộp [7] Token reset: IP mới + token mới, chat vẫn giữ để resume
+        if [ "$TOKEN_RESET_ON_LIMIT" = "1" ]; then
+            token_reset quiet
+            echo "    Token đã xoá (chat giữ nguyên) — dùng IP + token mới."
+        fi
+
         # optionally probe new IP
         if [ "$PROBE" = "1" ] && [ "$EGRESS" != "NONE" ]; then
             local probe_ok=false
@@ -1042,8 +1049,8 @@ token_reset() {
     # Remove auth/token files but keep chats
     find "$DATA_DIR" \( -name "*.token" -o -name "auth.json" -o -name "credentials*" \) \
         -exec rm -f {} + 2>/dev/null || true
-    echo "  Tokens cleared. Chats untouched."
-    log "token reset" reset
+    [ "${1:-}" = "quiet" ] || echo "  Tokens cleared. Chats untouched."
+    log "token reset ${1:-}" reset
 }
 
 # ---------------------------------------------------------------
