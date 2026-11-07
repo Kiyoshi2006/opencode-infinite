@@ -310,7 +310,23 @@ warp_up() {
         ACTIVE_PROXY=""; log "warp proxy port not listening" warp; return 1
     fi
 
-    ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
+    # WARP proxy mode là SOCKS5. Kiểm tra thật: traffic qua proxy có ra Cloudflare (warp=on) không
+    local t
+    t="$(curl -s --max-time 10 --proxy "http://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
+    if echo "$t" | grep -qE '^warp=(on|plus)'; then
+        ACTIVE_PROXY="http://127.0.0.1:$PROXY_PORT"
+    else
+        t="$(curl -s --max-time 10 --proxy "socks5h://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
+        if echo "$t" | grep -qE '^warp=(on|plus)'; then
+            WARP_HTTP_PORT=40001
+            start_http_bridge "$WARP_HTTP_PORT" "$PROXY_PORT" || { ACTIVE_PROXY=""; return 1; }
+            ACTIVE_PROXY="http://127.0.0.1:$WARP_HTTP_PORT"
+        else
+            echo -e "${C_ERR}  [!] Traffic qua WARP proxy KHÔNG ra Cloudflare (warp!=on) — không dùng WARP.${C_RST}"
+            log "warp trace failed: $t" warp
+            ACTIVE_PROXY=""; return 1
+        fi
+    fi
     echo -e "${C_OK}  WARP proxy up → $ACTIVE_PROXY${C_RST}"
     log "warp proxy up on $ACTIVE_PROXY" warp
 }
@@ -353,6 +369,113 @@ install_tor_portable() {
         echo -e "${C_WARN}  [!] Could not install Tor via apt.${C_RST}"
         return 1
     fi
+}
+
+# ---------------------------------------------------------------
+# HTTP(CONNECT) -> SOCKS5 bridge (python3). OpenCode (Bun) chỉ hiểu HTTP proxy,
+# trong khi WARP proxy mode / Tor chỉ nói SOCKS5.
+# ---------------------------------------------------------------
+start_http_bridge() {
+    local http_port="$1" socks_port="$2"
+    if nc -z 127.0.0.1 "$http_port" 2>/dev/null; then
+        echo "    [bridge] port $http_port đã có — dùng lại"
+        return 0
+    fi
+    if ! have_cmd python3; then
+        echo -e "${C_WARN}  [!] Cần python3 cho HTTP bridge: sudo apt install -y python3${C_RST}"
+        return 1
+    fi
+    mkdir -p "$STATE_DIR"
+    local bf="$STATE_DIR/http2socks.py"
+    cat > "$bf" <<'PYEOF'
+import sys, socket, threading, struct, select
+
+http_port = int(sys.argv[1])
+socks_port = int(sys.argv[2])
+
+def socks5_connect(host, port):
+    s = socket.create_connection(('127.0.0.1', socks_port), timeout=15)
+    s.sendall(b'\x05\x01\x00')
+    if s.recv(2) != b'\x05\x00':
+        raise IOError('SOCKS5 handshake failed')
+    hb = host.encode()
+    s.sendall(b'\x05\x01\x00\x03' + bytes([len(hb)]) + hb + struct.pack('>H', port))
+    resp = s.recv(10)
+    if len(resp) < 2 or resp[1] != 0:
+        raise IOError('SOCKS5 connect failed')
+    s.settimeout(None)
+    return s
+
+def pipe(a, b):
+    try:
+        while True:
+            r, _, _ = select.select([a, b], [], [], 120)
+            if not r:
+                break
+            for s in r:
+                d = s.recv(65536)
+                if not d:
+                    return
+                (b if s is a else a).sendall(d)
+    except Exception:
+        pass
+
+def handle(client):
+    remote = None
+    try:
+        data = b''
+        while b'\r\n\r\n' not in data:
+            chunk = client.recv(65536)
+            if not chunk:
+                return
+            data += chunk
+        head, _, rest = data.partition(b'\r\n\r\n')
+        line = head.split(b'\r\n')[0].decode('latin1')
+        method, target = line.split()[0], line.split()[1]
+        if method == 'CONNECT':
+            host, port = target.rsplit(':', 1)
+            remote = socks5_connect(host, int(port))
+            client.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
+            if rest:
+                remote.sendall(rest)
+        else:
+            # plain HTTP proxy request: http://host[:port]/path
+            u = target.split('://', 1)[-1]
+            hostport, _, path = u.partition('/')
+            host, _, port = hostport.partition(':')
+            remote = socks5_connect(host, int(port or 80))
+            lines = head.split(b'\r\n')
+            lines[0] = (method + ' /' + path + ' ' + line.split()[2]).encode('latin1')
+            remote.sendall(b'\r\n'.join(lines) + b'\r\n\r\n' + rest)
+        pipe(client, remote)
+    except Exception:
+        pass
+    finally:
+        for x in (remote, client):
+            try:
+                if x: x.close()
+            except Exception:
+                pass
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', http_port))
+srv.listen(128)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PYEOF
+    python3 "$bf" "$http_port" "$socks_port" >/dev/null 2>&1 &
+    OURBRIDGE=$!
+    disown "$OURBRIDGE" 2>/dev/null || true
+    log "http bridge pid=$OURBRIDGE http=$http_port socks=$socks_port" bridge
+    sleep 1
+    if ! nc -z 127.0.0.1 "$http_port" 2>/dev/null; then
+        echo -e "${C_ERR}  [!] HTTP bridge không khởi động được (port $http_port).${C_RST}"
+        return 1
+    fi
+    echo "    [bridge] HTTP:$http_port → SOCKS5:$socks_port"
+    return 0
 }
 
 tor_setup() {
@@ -399,80 +522,7 @@ tor_setup() {
         fi
     fi
 
-    # HTTP→SOCKS5 bridge using socat (process-scoped)
-    if nc -z 127.0.0.1 "$TOR_HTTP_PORT" 2>/dev/null; then
-        echo "    [bridge] port $TOR_HTTP_PORT already in use — reusing"
-    else
-        if have_cmd socat; then
-            socat TCP-LISTEN:$TOR_HTTP_PORT,fork,reuseaddr \
-                SOCKS5:127.0.0.1:127.0.0.1:80,socksport=$TOR_SOCKS_PORT &
-            OURBRIDGE=$!
-            log "socat bridge pid=$OURBRIDGE port=$TOR_HTTP_PORT" tor
-            echo "    [bridge] HTTP→SOCKS5 on port $TOR_HTTP_PORT (socat)"
-        elif have_cmd python3; then
-            # minimal Python HTTP-CONNECT proxy that forwards to Tor SOCKS5
-            python3 - "$TOR_HTTP_PORT" "$TOR_SOCKS_PORT" <<'PYEOF' &
-import sys, socket, threading, struct, select
-
-http_port = int(sys.argv[1])
-socks_port = int(sys.argv[2])
-
-def socks5_connect(host, port):
-    s = socket.create_connection(('127.0.0.1', socks_port), timeout=10)
-    s.send(b'\x05\x01\x00')
-    if s.recv(2) != b'\x05\x00':
-        raise IOError('SOCKS5 auth failed')
-    host_b = host.encode()
-    s.send(b'\x05\x01\x00\x03' + bytes([len(host_b)]) + host_b + struct.pack('>H', port))
-    resp = s.recv(10)
-    if resp[1] != 0:
-        raise IOError(f'SOCKS5 connect failed code={resp[1]}')
-    return s
-
-def pipe(a, b):
-    try:
-        while True:
-            r, _, _ = select.select([a, b], [], [], 30)
-            if not r: break
-            for s in r:
-                d = s.recv(4096)
-                if not d: return
-                (b if s is a else a).sendall(d)
-    except Exception:
-        pass
-
-def handle(client):
-    try:
-        data = b''
-        while b'\r\n\r\n' not in data:
-            data += client.recv(4096)
-        line = data.split(b'\r\n')[0].decode()
-        if line.startswith('CONNECT '):
-            hp = line.split()[1]
-            host, port = hp.rsplit(':', 1)
-            remote = socks5_connect(host, int(port))
-            client.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
-            pipe(client, remote)
-            remote.close()
-        client.close()
-    except Exception:
-        try: client.close()
-        except Exception: pass
-
-srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(('127.0.0.1', http_port)); srv.listen(50)
-while True:
-    c, _ = srv.accept()
-    threading.Thread(target=handle, args=(c,), daemon=True).start()
-PYEOF
-            OURBRIDGE=$!
-            log "python bridge pid=$OURBRIDGE port=$TOR_HTTP_PORT" tor
-            echo "    [bridge] HTTP→SOCKS5 on port $TOR_HTTP_PORT (python3)"
-        else
-            echo -e "${C_WARN}  [!] Neither socat nor python3 found — install one for Tor HTTP bridge.${C_RST}"
-            return 1
-        fi
-    fi
+    start_http_bridge "$TOR_HTTP_PORT" "$TOR_SOCKS_PORT" || return 1
     sleep 1
     ACTIVE_PROXY="http://127.0.0.1:$TOR_HTTP_PORT"
     return 0
@@ -877,7 +927,8 @@ auto_rotate_loop() {
         scan_log
         local fatal="${FHIT:-}${QHIT:-}"
 
-        if [ -z "$fatal" ] && [ "$rc" -eq 0 ]; then
+        if [ -z "$fatal" ]; then
+            [ "$rc" -ne 0 ] && echo -e "${C_WARN}  (OpenCode thoát rc=$rc, không thấy lỗi limit trong log — không rotate)${C_RST}"
             # clean exit — hỏi user muốn làm gì
             echo ""
             echo -e "${C_OK}  OpenCode đã thoát.${C_RST}"
