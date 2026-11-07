@@ -122,7 +122,7 @@ log_pipe() {
 
 trim_log() {
     local f="$1" max_kb="${2:-1024}"
-    [ -f "$f" ] || return
+    [ -f "$f" ] || return 0
     local max_b=$(( max_kb * 1024 ))
     local sz; sz="$(wc -c < "$f" 2>/dev/null || echo 0)"
     if [ "$sz" -gt "$max_b" ]; then
@@ -171,6 +171,9 @@ cleanup() {
         kill "$OURBRIDGE" 2>/dev/null || true
     fi
 }
+# clear có thể trả lỗi khi TERM không hợp lệ (SSH/cron) — không để set -e thoát vì nó
+clear() { command clear 2>/dev/null || true; }
+
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
@@ -355,7 +358,7 @@ wait_warp_ready() {
     return 1
 }
 
-warp_# ---------------------------------------------------------------
+# ---------------------------------------------------------------
 # Dải IP đã bị limit (WARP cấp IP khác nhau nhưng cùng /64 → server limit cả dải)
 # ---------------------------------------------------------------
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
@@ -387,7 +390,7 @@ burn_is() {
     awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$1 > n - t && $2 == p { f = 1 } END { exit !f }' "$BURN_FILE"
 }
 
-rotate() {
+warp_rotate() {
     log "warp_rotate: start" warp
     warp_cmd disconnect
     warp_cmd registration delete
@@ -1132,7 +1135,7 @@ deep_reset() {
     echo -e "${C_WARN}  [!] Deep reset: chat history will be archived to ~/Desktop.${C_RST}"
     echo -n "    Continue? [y/N]: "
     read -r ans
-    [[ "$ans" =~ ^[Yy]$ ]] || return
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
     pkill -f opencode 2>/dev/null || true
     local dest
     dest=~/Desktop/opencode-backup-"$(date +%Y%m%d-%H%M%S)"
