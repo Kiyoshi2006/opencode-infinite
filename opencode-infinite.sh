@@ -18,7 +18,7 @@ set -euo pipefail
 # ---------------------------------------------------------------
 # SETTINGS  (edit freely)
 # ---------------------------------------------------------------
-ROTATE_TRIES_MAX=4          # rotation attempts for infra problems
+ROTATE_TRIES_MAX=0          # số lần dính limit liên tiếp trước khi dừng (0 = vô hạn, Ctrl+C để dừng)
 IP_FIND_MAX=0               # 0 = hunt forever until a clean IP found
 WARP_WAIT=6                 # seconds after (re)connecting WARP
 ROTATE_COOLDOWN=10          # seconds between rotate attempts
@@ -30,7 +30,7 @@ WATCH=1                     # 1 = watch the log, rotate on fatal error
 RESUME_MSG="continue"       # message sent to resume the chat
 RESUME_AUTO=1               # 1 = auto-approve tool permissions on resume
 RESUME_TIMEOUT=90           # seconds the resume may run before killed
-RESUME_RETRY_MAX=10         # số lần retry/đổi IP khi gửi "continue" lỗi (0 = không giới hạn)
+RESUME_RETRY_MAX=0          # số lần retry/đổi IP khi gửi "continue" lỗi (0 = vô hạn)
 NET_PAT='(ECONNRESET|ERR_PROXY_TUNNEL|502 Bad Gateway|ETIMEDOUT|ECONNREFUSED|socket connection was closed|Unable to connect)'
 PROBE_MODEL="opencode/deepseek-v4.1-flash-free"
 PROBE=0                     # 1 = gửi 1 tin thử cho mỗi IP mới (mặc định tắt: chuỗi [3]+[7] đã chạy tốt không cần)
@@ -369,7 +369,7 @@ wait_warp_ready() {
 # ---------------------------------------------------------------
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
 BURN_TTL=86400          # nhớ dải bị limit trong 24h
-BURN_REROLL_MAX=8       # số lần đổi lại tối đa để ra khỏi dải đã burn
+BURN_REROLL_MAX=0       # số lần đổi lại tối đa để ra khỏi dải đã burn (0 = vô hạn)
 
 ip_prefix() {
     local ip="${1:-}"
@@ -923,9 +923,9 @@ rotate() {
         wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
         local reroll=0
-        while burn_is "$IP" && [ "$reroll" -lt "$BURN_REROLL_MAX" ]; do
+        while burn_is "$IP" && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
             reroll=$(( reroll + 1 ))
-            echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp ($reroll/$BURN_REROLL_MAX)..."
+            echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."
             warp_rotate
             sleep "$ROTATE_COOLDOWN"
             wait_warp_ready "$ACTIVE_PROXY" || true
@@ -1150,16 +1150,16 @@ auto_rotate_loop() {
                 break
             fi
             if [ "$rres" -eq 2 ]; then
-                echo -e "${C_WARN}  [resume] IP này vẫn bị limit — blacklist dải và đổi IP ($rr/${RESUME_RETRY_MAX})...${C_RST}"
+                echo -e "${C_WARN}  [resume] IP này vẫn bị limit — blacklist dải và đổi IP (lần $rr)...${C_RST}"
                 burn_mark "$IP"; rnet=0
             elif [ "$rres" -eq 3 ]; then
                 rnet=$(( rnet + 1 ))
                 if [ "$rnet" -lt 2 ]; then
                     echo -e "${C_WARN}  [resume] lỗi mạng — thử lại cùng IP...${C_RST}"; sleep 3; continue
                 fi
-                echo -e "${C_WARN}  [resume] lỗi mạng lặp lại — đổi tunnel ($rr/${RESUME_RETRY_MAX})...${C_RST}"; rnet=0
+                echo -e "${C_WARN}  [resume] lỗi mạng lặp lại — đổi tunnel (lần $rr)...${C_RST}"; rnet=0
             else
-                echo -e "${C_WARN}  [resume] lỗi khác — thử lại ($rr/${RESUME_RETRY_MAX})...${C_RST}"; sleep 3; continue
+                echo -e "${C_WARN}  [resume] lỗi khác — thử lại (lần $rr)...${C_RST}"; sleep 3; continue
             fi
             rotate "resume" || { echo -e "${C_ERR}  [!] Rotation failed.${C_RST}"; break; }
             [ "$TOKEN_RESET_ON_LIMIT" = "1" ] && token_reset quiet
