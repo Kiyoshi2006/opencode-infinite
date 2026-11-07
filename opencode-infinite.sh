@@ -26,7 +26,10 @@ AUTO_ROTATE=1               # 1 = auto-rotate on fatal log lines
 WARP_USE_BRIDGE=0          # 0 = dùng HTTP-proxy của WARP (:40000) như bản chạy tốt; 1 = ép qua bridge SOCKS5
 TOKEN_RESET_ON_LIMIT=1      # 1 = khi dính limit: xoay IP + xoá token (giữ chat) = gộp [7]+[1]
 WARP_CALL_TIMEOUT=15        # seconds a single warp-cli call may take
-WATCH=1                     # 1 = watch the log, rotate on fatal error
+WATCH=1
+HEALTH_WATCH=1             # 1 = kiểm tra proxy định kỳ khi OpenCode chạy, tự nối lại WARP nếu hỏng
+HEALTH_INTERVAL=20          # giây giữa 2 lần kiểm tra
+NET_HITS_MAX=4              # số dòng lỗi mạng (ECONNRESET/502...) trong log trước khi tự đóng + sửa tunnel
 RESUME_MSG="continue"       # message sent to resume the chat
 RESUME_AUTO=1               # 1 = auto-approve tool permissions on resume
 RESUME_TIMEOUT=90           # seconds the resume may run before killed
@@ -85,6 +88,7 @@ IP=""
 WARP_FLAG=""
 RESUME=""
 LAST_SID=""
+NETHIT=""
 SEND_RESUME_PROMPT=0
 CAP_RUN_CONTINUE=""; CAP_RUN_SESSION=""; CAP_AUTOFLAG=""; CAP_TUI_SESSION=""; CAP_TUI_PROMPT=""
 UNRECOG='(Unrecognized flag|Unknown (flag|option|argument)|unrecognized (option|argument)|Unexpected argument)'
@@ -857,36 +861,113 @@ probe_ip() {
 watch_pid=""
 
 FATAL_FLAG="$STATE_DIR/fatal.flag"
+NET_FLAG="$STATE_DIR/net.flag"
+HIT_FATAL="$STATE_DIR/hit.fatal"
+HIT_NET="$STATE_DIR/hit.net"
+health_pid=""; net_watch_pid=""
+
+# Kết nối lại WARP (proxy mode — không đụng SSH). Từ chối nếu không chắc đang ở proxy mode.
+warp_heal() {
+    [ "$EGRESS" = "WARP" ] || return 0
+    [ -n "$WARP_BIN" ] || return 0
+    if ! "$WARP_BIN" settings 2>/dev/null | grep -qiE 'Mode:[[:space:]]*WarpProxy'; then
+        log "heal skipped: not in proxy mode" heal; return 1
+    fi
+    log "heal: reconnect warp" heal
+    warp_cmd disconnect
+    sleep 2
+    warp_cmd connect
+    sleep "$WARP_WAIT"
+    wait_warp_ready "$ACTIVE_PROXY" || true
+    return 0
+}
+
+# Đổi đường proxy: HTTP-proxy của WARP <-> bridge SOCKS5
+warp_switch_path() {
+    [ "$EGRESS" = "WARP" ] || return 0
+    if [ "$ACTIVE_PROXY" = "http://127.0.0.1:${PROXY_PORT:-40000}" ]; then
+        if start_http_bridge 40001 "${PROXY_PORT:-40000}"; then ACTIVE_PROXY="http://127.0.0.1:40001"; fi
+    else
+        ACTIVE_PROXY="http://127.0.0.1:${PROXY_PORT:-40000}"
+    fi
+    log "switch proxy path -> $ACTIVE_PROXY" heal
+    return 0
+}
+
+health_start() {
+    [ "$HEALTH_WATCH" = "1" ] || return 0
+    [ "$EGRESS" = "WARP" ] && [ -n "$ACTIVE_PROXY" ] || return 0
+    (
+        fails=0
+        while true; do
+            sleep "$HEALTH_INTERVAL"
+            t="$(curl -s -m 8 --proxy "$ACTIVE_PROXY" "$TRACE_URL" 2>/dev/null || true)"
+            if echo "$t" | grep -qE '^warp=(on|plus)'; then fails=0; continue; fi
+            fails=$(( fails + 1 ))
+            log "health check fail $fails" heal
+            if [ "$fails" -ge 2 ]; then warp_heal || true; fails=0; fi
+        done
+    ) >/dev/null 2>&1 &
+    health_pid=$!
+}
+
+health_stop() {
+    if [ -n "${health_pid:-}" ]; then
+        kill "$health_pid" 2>/dev/null || true
+        wait "$health_pid" 2>/dev/null || true
+    fi
+    health_pid=""
+}
 
 watch_start() {
     [ "$WATCH" = "1" ] || return 0
     [ -z "$LOGFILE" ] && return 0
-    QHIT=""; FHIT=""
-    rm -f "$FATAL_FLAG"
+    QHIT=""; FHIT=""; NETHIT=""
     mkdir -p "$STATE_DIR"
-    # Theo dõi log MỚI (-n 0). Khi thấy dòng limit: đánh dấu rồi tự đóng OpenCode
-    # → vòng lặp chính tự xoay IP + xoá token + resume. Không cần bấm Ctrl+C.
+    rm -f "$FATAL_FLAG" "$NET_FLAG" "$HIT_FATAL" "$HIT_NET"
+    # (1) dính limit → đánh dấu rồi tự đóng OpenCode → vòng lặp xoay IP + resume.
+    # Hành động chỉ chạy nếu grep THỰC SỰ khớp (file hit không rỗng); watch_stop giết pipeline thì không làm gì.
     (
-        tail -F -n 0 "$LOGFILE" 2>/dev/null | \
-        grep -m1 --line-buffered -iE "$OC_PAT" >/dev/null 2>&1
+        tail -F -n 0 "$LOGFILE" 2>/dev/null | grep -m1 --line-buffered -iE "$OC_PAT" >"$HIT_FATAL" 2>/dev/null || true
+        pkill -P "$BASHPID" 2>/dev/null || true
+        [ -s "$HIT_FATAL" ] || exit 0
         touch "$FATAL_FLAG"
-        sleep 3                       # cho OpenCode kịp ghi/hiển thị lỗi
+        sleep 3                       # cho OpenCode kịp hiển thị lỗi
         pkill -TERM -x opencode 2>/dev/null || true
         sleep 5
         pkill -KILL -x opencode 2>/dev/null || true
     ) &
     watch_pid=$!
-    log "watcher started pid=$watch_pid" watch
+    # (2) lỗi mạng lặp lại (OpenCode tự retry vô hạn nên script phải can thiệp)
+    (
+        tail -F -n 0 "$LOGFILE" 2>/dev/null | grep -m"$NET_HITS_MAX" --line-buffered -iE "$NET_PAT" >"$HIT_NET" 2>/dev/null || true
+        pkill -P "$BASHPID" 2>/dev/null || true
+        [ "$(wc -l <"$HIT_NET" 2>/dev/null || echo 0)" -ge "$NET_HITS_MAX" ] || exit 0
+        [ -f "$FATAL_FLAG" ] && exit 0
+        touch "$NET_FLAG"
+        sleep 2
+        pkill -TERM -x opencode 2>/dev/null || true
+        sleep 5
+        pkill -KILL -x opencode 2>/dev/null || true
+    ) &
+    net_watch_pid=$!
+    health_start
+    log "watchers started fatal=$watch_pid net=$net_watch_pid health=${health_pid:-none}" watch
 }
 
 watch_stop() {
-    if [ -n "${watch_pid:-}" ]; then
-        pkill -P "$watch_pid" 2>/dev/null || true   # tail + grep con
-        kill "$watch_pid" 2>/dev/null || true
-        wait "$watch_pid" 2>/dev/null || true
-    fi
-    watch_pid=""
+    health_stop
+    local pid
+    for pid in "${watch_pid:-}" "${net_watch_pid:-}"; do
+        [ -n "$pid" ] || continue
+        pkill -P "$pid" 2>/dev/null || true
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    watch_pid=""; net_watch_pid=""
     if [ -f "$FATAL_FLAG" ]; then FHIT=1; rm -f "$FATAL_FLAG"; fi
+    if [ -f "$NET_FLAG" ];   then NETHIT=1; rm -f "$NET_FLAG"; fi
+    rm -f "$HIT_FATAL" "$HIT_NET"
 }
 
 scan_log() {
@@ -1035,7 +1116,7 @@ run_opencode() {
 # ---------------------------------------------------------------
 auto_rotate_loop() {
     local runargs="${1:-}"
-    local tries=0
+    local tries=0 netfails=0
 
     # Kết nối egress lần đầu (nếu chưa kết nối)
     if [ "$WARP_UP" = "0" ] || [ -z "$ACTIVE_PROXY" -a "$EGRESS" != "NONE" ]; then
@@ -1051,6 +1132,26 @@ auto_rotate_loop() {
         # check if a fatal/quota line was seen
         scan_log || true
         local fatal="${FHIT:-}${QHIT:-}"
+
+        if [ -z "$fatal" ] && [ -n "${NETHIT:-}" ]; then
+            netfails=$(( netfails + 1 ))
+            log "net errors -> repair step $netfails" heal
+            if [ "$netfails" -eq 1 ]; then
+                echo -e "${C_WARN}  [!] Lỗi mạng lặp lại (ECONNRESET/502…) — nối lại WARP rồi mở lại session...${C_RST}"
+                warp_heal || true
+            elif [ "$netfails" -eq 2 ]; then
+                echo -e "${C_WARN}  [!] Vẫn lỗi mạng — đổi đường proxy (HTTP ⇄ bridge) rồi mở lại...${C_RST}"
+                warp_switch_path; warp_heal || true
+            else
+                echo -e "${C_WARN}  [!] Vẫn lỗi mạng — đổi hẳn IP (đăng ký WARP mới) rồi mở lại...${C_RST}"
+                rotate "net" || true
+                [ "$TOKEN_RESET_ON_LIMIT" = "1" ] && token_reset quiet
+                netfails=0
+            fi
+            RESUME=1; SEND_RESUME_PROMPT=1
+            continue
+        fi
+        netfails=0
 
         if [ -z "$fatal" ]; then
             [ "$rc" -ne 0 ] && echo -e "${C_WARN}  (OpenCode thoát rc=$rc, không thấy lỗi limit trong log — không rotate)${C_RST}"
