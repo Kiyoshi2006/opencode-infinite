@@ -379,9 +379,12 @@ install_tor_portable() {
 # ---------------------------------------------------------------
 start_http_bridge() {
     local http_port="$1" socks_port="$2"
+    # Luôn khởi động lại bridge của mình (bản cũ có thể còn sống từ lần chạy trước)
+    pkill -f "http2socks.py $http_port " 2>/dev/null || true
+    sleep 0.3
     if nc -z 127.0.0.1 "$http_port" 2>/dev/null; then
-        echo "    [bridge] port $http_port đã có — dùng lại"
-        return 0
+        echo -e "${C_WARN}  [!] Port $http_port đang bị chương trình khác dùng.${C_RST}"
+        return 1
     fi
     if ! have_cmd python3; then
         echo -e "${C_WARN}  [!] Cần python3 cho HTTP bridge: sudo apt install -y python3${C_RST}"
@@ -395,23 +398,39 @@ import sys, socket, threading, struct, select
 http_port = int(sys.argv[1])
 socks_port = int(sys.argv[2])
 
+def recvn(s, n):
+    buf = b''
+    while len(buf) < n:
+        c = s.recv(n - len(buf))
+        if not c:
+            raise IOError('socks closed')
+        buf += c
+    return buf
+
 def socks5_connect(host, port):
-    s = socket.create_connection(('127.0.0.1', socks_port), timeout=15)
+    s = socket.create_connection(('127.0.0.1', socks_port), timeout=20)
     s.sendall(b'\x05\x01\x00')
-    if s.recv(2) != b'\x05\x00':
+    if recvn(s, 2) != b'\x05\x00':
         raise IOError('SOCKS5 handshake failed')
     hb = host.encode()
     s.sendall(b'\x05\x01\x00\x03' + bytes([len(hb)]) + hb + struct.pack('>H', port))
-    resp = s.recv(10)
-    if len(resp) < 2 or resp[1] != 0:
-        raise IOError('SOCKS5 connect failed')
+    h = recvn(s, 4)                      # VER REP RSV ATYP
+    if h[1] != 0:
+        raise IOError('SOCKS5 connect failed rep=%d' % h[1])
+    atyp = h[3]
+    if atyp == 1:
+        recvn(s, 4 + 2)
+    elif atyp == 4:
+        recvn(s, 16 + 2)                 # WARP trả địa chỉ IPv6 -> phải đọc đủ, không để lọt vào luồng TLS
+    elif atyp == 3:
+        recvn(s, recvn(s, 1)[0] + 2)
     s.settimeout(None)
     return s
 
 def pipe(a, b):
     try:
         while True:
-            r, _, _ = select.select([a, b], [], [], 120)
+            r, _, _ = select.select([a, b], [], [], 900)
             if not r:
                 break
             for s in r:
@@ -467,7 +486,7 @@ while True:
     c, _ = srv.accept()
     threading.Thread(target=handle, args=(c,), daemon=True).start()
 PYEOF
-    python3 "$bf" "$http_port" "$socks_port" >/dev/null 2>&1 &
+    python3 "$bf" "$http_port" "$socks_port" >/dev/null 2>&1 &   # cmdline: http2socks.py <http> <socks>
     OURBRIDGE=$!
     disown "$OURBRIDGE" 2>/dev/null || true
     log "http bridge pid=$OURBRIDGE http=$http_port socks=$socks_port" bridge
