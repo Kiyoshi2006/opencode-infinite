@@ -84,6 +84,10 @@ FHIT=""
 IP=""
 WARP_FLAG=""
 RESUME=""
+LAST_SID=""
+SEND_RESUME_PROMPT=0
+CAP_RUN_CONTINUE=""; CAP_RUN_SESSION=""; CAP_AUTOFLAG=""; CAP_TUI_SESSION=""; CAP_TUI_PROMPT=""
+UNRECOG='(Unrecognized flag|Unknown (flag|option|argument)|unrecognized (option|argument)|Unexpected argument)'
 COLD=0
 OURTOR=""
 OURBRIDGE=""
@@ -733,16 +737,24 @@ install_opencode() {
 }
 
 detect_caps() {
-    CAP_STANDALONE=""
-    CAP_SERVICE=""
-    [ -z "$OC_CMD" ] && return
-    if "$OC_CMD" run --help 2>&1 | grep -q 'standalone'; then
-        CAP_STANDALONE=1
-    fi
-    if "$OC_CMD" service --help 2>/dev/null | grep -q 'service\|start'; then
-        CAP_SERVICE=1
-    fi
-    log "caps standalone=$CAP_STANDALONE service=$CAP_SERVICE" deps
+    CAP_STANDALONE=""; CAP_SERVICE=""
+    CAP_RUN_CONTINUE=""; CAP_RUN_SESSION=""; CAP_AUTOFLAG=""; CAP_TUI_SESSION=""; CAP_TUI_PROMPT=""
+    [ -z "$OC_CMD" ] && return 0
+    local run_help top_help f
+    run_help="$("$OC_CMD" run --help 2>&1 || true)"
+    top_help="$("$OC_CMD" --help 2>&1 || true)"
+    echo "$run_help" | grep -q 'standalone' && CAP_STANDALONE=1
+    echo "$run_help" | grep -q -- '--continue' && CAP_RUN_CONTINUE="--continue"
+    echo "$run_help" | grep -q -- '--session'  && CAP_RUN_SESSION="--session"
+    # cờ tự duyệt quyền: tuỳ phiên bản, chỉ dùng nếu help có liệt kê
+    for f in --auto-approve --dangerously-skip-permissions --yolo --allow-all --yes; do
+        if echo "$run_help" | grep -q -- "$f"; then CAP_AUTOFLAG="$f"; break; fi
+    done
+    echo "$top_help" | grep -q -- '--session' && CAP_TUI_SESSION="--session"
+    echo "$top_help" | grep -q -- '--prompt'  && CAP_TUI_PROMPT=1
+    if "$OC_CMD" service --help 2>/dev/null | grep -q 'service\|start'; then CAP_SERVICE=1; fi
+    log "caps standalone=$CAP_STANDALONE run_continue=$CAP_RUN_CONTINUE run_session=$CAP_RUN_SESSION auto=$CAP_AUTOFLAG tui_session=$CAP_TUI_SESSION tui_prompt=$CAP_TUI_PROMPT" deps
+    return 0
 }
 
 oc_update_check() {
@@ -946,17 +958,26 @@ rotate() {
 #   0 = OK, 2 = dính limit (IP bị burn), 3 = lỗi mạng/timeout (đổi tunnel, không burn), 1 = lỗi khác
 resume_chat() {
     log "resume start" resume
+    local -a args=(run)
+    [ -n "$CAP_STANDALONE" ] && args+=(--standalone)
+    [ -n "$CAP_AUTOFLAG" ] && [ "${RESUME_AUTO:-0}" = "1" ] && args+=("$CAP_AUTOFLAG")
+    if [ -n "$LAST_SID" ] && [ -n "$CAP_RUN_SESSION" ]; then
+        args+=("$CAP_RUN_SESSION" "$LAST_SID")
+    elif [ -n "$CAP_RUN_CONTINUE" ]; then
+        args+=("$CAP_RUN_CONTINUE")
+    else
+        echo -e "${C_WARN}  [resume] OpenCode này không có --continue/--session cho 'run' — bỏ qua resume tự động.${C_RST}"
+        return 4
+    fi
+    args+=("$RESUME_MSG")
     echo -e "${C_CYAN}  [resume] Gửi: $RESUME_MSG (tối đa ${RESUME_TIMEOUT}s)${C_RST}"
+    log "resume args: ${args[*]}" resume
     local out rc=0
-    out="$(run_cmd_proxy "$ACTIVE_PROXY" timeout "$RESUME_TIMEOUT" \
-        "$OC_CMD" run \
-        ${CAP_STANDALONE:+--standalone} \
-        ${RESUME_AUTO:+--auto-approve} \
-        --continue \
-        "$RESUME_MSG" 2>&1 </dev/null)" || rc=$?
+    out="$(run_cmd_proxy "$ACTIVE_PROXY" timeout "$RESUME_TIMEOUT" "$OC_CMD" "${args[@]}" 2>&1 </dev/null)" || rc=$?
     echo "$out" | tail -6 | cut -c1-200
     log "resume done rc=$rc" resume
     if echo "$out" | grep -qiE "$OC_PAT"; then return 2; fi
+    if echo "$out" | grep -qiE "$UNRECOG"; then return 4; fi
     if [ "$rc" -eq 124 ]; then echo -e "${C_WARN}  [resume] quá ${RESUME_TIMEOUT}s.${C_RST}"; return 3; fi
     if echo "$out" | grep -qiE "$NET_PAT"; then return 3; fi
     [ "$rc" -ne 0 ] && return 1
@@ -983,11 +1004,24 @@ run_opencode() {
     LOG_RUN_OFF="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
 
     local rc=0
+    local -a extra=()
+    if [ -n "${RESUME:-}" ]; then
+        if [ -n "$LAST_SID" ] && [ -n "$CAP_TUI_SESSION" ]; then
+            extra+=("$CAP_TUI_SESSION" "$LAST_SID")
+        else
+            extra+=(--continue)
+        fi
+        if [ "${SEND_RESUME_PROMPT:-0}" = "1" ] && [ -n "$CAP_TUI_PROMPT" ]; then
+            extra+=(--prompt "$RESUME_MSG")
+        fi
+    fi
+    SEND_RESUME_PROMPT=0
+    log "launch args: ${extra[*]:-(none)}" run
     trap : INT
     # shellcheck disable=SC2086
     (cd "$OPFOLDER" && \
      run_cmd_proxy "$ACTIVE_PROXY" "$OC_CMD" \
-         ${RESUME:+--continue} \
+         "${extra[@]}" \
          $runargs) || rc=$?
 
     trap 'exit 130' INT
@@ -1052,6 +1086,9 @@ auto_rotate_loop() {
 
         echo -e "${C_WARN}  [!] Fatal/quota hit — rotating egress (try $tries)...${C_RST}"
         burn_mark "$IP"
+        local sid
+        sid="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -oE 'sessionID=ses_[A-Za-z0-9]+' | tail -1 | cut -d= -f2)"
+        [ -n "$sid" ] && LAST_SID="$sid"
         local trig
         trig="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1 | cut -c1-220)"
         [ -n "$trig" ] && echo "      Dòng log kích hoạt: $trig"
@@ -1095,9 +1132,18 @@ auto_rotate_loop() {
         # resume the chat on new egress — tự retry (giống /retry): lỗi → đổi IP → gửi lại
         RESUME=1
         local rr=0 rres=0 rnet=0
+        if [ -n "$CAP_TUI_PROMPT" ]; then
+            SEND_RESUME_PROMPT=1
+            echo -e "${C_CYAN}  [resume] Sẽ tự gửi \"$RESUME_MSG\" ngay khi mở OpenCode (session: ${LAST_SID:-gần nhất}).${C_RST}"
+            continue
+        fi
         while true; do
             rres=0; resume_chat || rres=$?
             [ "$rres" -eq 0 ] && break
+            if [ "$rres" -eq 4 ]; then
+                echo -e "${C_WARN}  [resume] không gửi được tự động — mở OpenCode, bạn gõ 'continue' tay.${C_RST}"
+                break
+            fi
             rr=$(( rr + 1 ))
             if [ "$RESUME_RETRY_MAX" -gt 0 ] && [ "$rr" -ge "$RESUME_RETRY_MAX" ]; then
                 echo -e "${C_WARN}  [resume] đã thử $rr lần — mở OpenCode để bạn xử lý tay.${C_RST}"
@@ -1354,7 +1400,7 @@ main() {
         case "$choice" in
         1)
             # Fresh start = [3] đổi IP + [7] reset token, rồi mở OpenCode
-            RESUME=""
+            RESUME=""; LAST_SID=""
             clear
             if [ "$EGRESS" != "NONE" ]; then
                 if [ "$WARP_UP" != "1" ]; then
@@ -1380,7 +1426,7 @@ main() {
             ;;
         4) folder_menu ;;
         5) deep_reset ;;
-        7) token_reset; RESUME=""; clear; auto_rotate_loop ;;
+        7) token_reset; RESUME=""; LAST_SID=""; clear; auto_rotate_loop ;;
         8) settings_menu; WARP_UP=0; ACTIVE_PROXY="" ;;
         q|Q) break ;;
         *) ;;
