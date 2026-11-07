@@ -30,6 +30,8 @@ WATCH=1                     # 1 = watch the log, rotate on fatal error
 RESUME_MSG="continue"       # message sent to resume the chat
 RESUME_AUTO=1               # 1 = auto-approve tool permissions on resume
 RESUME_TIMEOUT=90           # seconds the resume may run before killed
+RESUME_RETRY_MAX=10         # số lần retry/đổi IP khi gửi "continue" lỗi (0 = không giới hạn)
+NET_PAT='(ECONNRESET|ERR_PROXY_TUNNEL|502 Bad Gateway|ETIMEDOUT|ECONNREFUSED|socket connection was closed|Unable to connect)'
 PROBE_MODEL="opencode/deepseek-v4.1-flash-free"
 PROBE=0                     # 1 = gửi 1 tin thử cho mỗi IP mới (mặc định tắt: chuỗi [3]+[7] đã chạy tốt không cần)
 PROBE_BROKEN_MAX=3          # non-limit probe failures before giving up
@@ -876,13 +878,14 @@ watch_stop() {
 }
 
 scan_log() {
-    # Chỉ đọc log được ghi SAU khi OpenCode lần này bắt đầu chạy
+    # Chỉ đọc phần log GHI THÊM sau khi OpenCode lần này khởi động (không đọc dòng limit cũ
+    # → tránh blacklist oan IP tốt khi người dùng tự thoát bằng Ctrl+C).
     [ -f "$LOGFILE" ] || return 1
-    local since="${LOG_RUN_TS:-0}"
-    # Lọc theo file modification time: chỉ xét nếu log được sửa gần đây
-    local log_mt; log_mt="$(stat -c %Y "$LOGFILE" 2>/dev/null || echo 0)"
-    [ "$log_mt" -lt "$since" ] && return 1
-    if tail -200 "$LOGFILE" 2>/dev/null | grep -qiE "$OC_PAT"; then
+    local off="${LOG_RUN_OFF:-0}" size
+    size="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
+    [ "$size" -lt "$off" ] && off=0          # log bị xoay/cắt → đọc từ đầu
+    [ "$size" -le "$off" ] && return 1
+    if tail -c +$(( off + 1 )) "$LOGFILE" 2>/dev/null | grep -qiE "$OC_PAT"; then
         QHIT=1; return 0
     fi
     return 1
@@ -939,21 +942,24 @@ rotate() {
 # ---------------------------------------------------------------
 # RESUME CHAT
 # ---------------------------------------------------------------
+# Gửi RESUME_MSG vào chat gần nhất (headless). Trả về:
+#   0 = OK, 2 = dính limit (IP bị burn), 3 = lỗi mạng/timeout (đổi tunnel, không burn), 1 = lỗi khác
 resume_chat() {
     log "resume start" resume
-    echo -e "${C_CYAN}  [resume] Sending: $RESUME_MSG${C_RST}"
-    local rc=0
-    run_cmd_proxy "$ACTIVE_PROXY" timeout "$RESUME_TIMEOUT" \
+    echo -e "${C_CYAN}  [resume] Gửi: $RESUME_MSG (tối đa ${RESUME_TIMEOUT}s)${C_RST}"
+    local out rc=0
+    out="$(run_cmd_proxy "$ACTIVE_PROXY" timeout "$RESUME_TIMEOUT" \
         "$OC_CMD" run \
         ${CAP_STANDALONE:+--standalone} \
         ${RESUME_AUTO:+--auto-approve} \
         --continue \
-        "$RESUME_MSG" 2>&1 | tail -5 || rc=$?
-    if [ "$rc" -eq 124 ]; then
-        echo -e "${C_WARN}  [resume] timed out — will rotate.${C_RST}"
-        return 1
-    fi
+        "$RESUME_MSG" 2>&1 </dev/null)" || rc=$?
+    echo "$out" | tail -6 | cut -c1-200
     log "resume done rc=$rc" resume
+    if echo "$out" | grep -qiE "$OC_PAT"; then return 2; fi
+    if [ "$rc" -eq 124 ]; then echo -e "${C_WARN}  [resume] quá ${RESUME_TIMEOUT}s.${C_RST}"; return 3; fi
+    if echo "$out" | grep -qiE "$NET_PAT"; then return 3; fi
+    [ "$rc" -ne 0 ] && return 1
     return 0
 }
 
@@ -974,6 +980,7 @@ run_opencode() {
 
     # Ghi timestamp trước khi chạy → scan_log chỉ đọc log SAU điểm này
     LOG_RUN_TS="$(date '+%s')"
+    LOG_RUN_OFF="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
 
     local rc=0
     trap : INT
@@ -1046,7 +1053,7 @@ auto_rotate_loop() {
         echo -e "${C_WARN}  [!] Fatal/quota hit — rotating egress (try $tries)...${C_RST}"
         burn_mark "$IP"
         local trig
-        trig="$(tail -300 "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1 | cut -c1-220)"
+        trig="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1 | cut -c1-220)"
         [ -n "$trig" ] && echo "      Dòng log kích hoạt: $trig"
         log "fatal trigger: ${trig:-none (rc=$rc)}" run
 
@@ -1085,9 +1092,32 @@ auto_rotate_loop() {
             done
         fi
 
-        # resume the chat on new egress
+        # resume the chat on new egress — tự retry (giống /retry): lỗi → đổi IP → gửi lại
         RESUME=1
-        resume_chat || true
+        local rr=0 rres=0 rnet=0
+        while true; do
+            rres=0; resume_chat || rres=$?
+            [ "$rres" -eq 0 ] && break
+            rr=$(( rr + 1 ))
+            if [ "$RESUME_RETRY_MAX" -gt 0 ] && [ "$rr" -ge "$RESUME_RETRY_MAX" ]; then
+                echo -e "${C_WARN}  [resume] đã thử $rr lần — mở OpenCode để bạn xử lý tay.${C_RST}"
+                break
+            fi
+            if [ "$rres" -eq 2 ]; then
+                echo -e "${C_WARN}  [resume] IP này vẫn bị limit — blacklist dải và đổi IP ($rr/${RESUME_RETRY_MAX})...${C_RST}"
+                burn_mark "$IP"; rnet=0
+            elif [ "$rres" -eq 3 ]; then
+                rnet=$(( rnet + 1 ))
+                if [ "$rnet" -lt 2 ]; then
+                    echo -e "${C_WARN}  [resume] lỗi mạng — thử lại cùng IP...${C_RST}"; sleep 3; continue
+                fi
+                echo -e "${C_WARN}  [resume] lỗi mạng lặp lại — đổi tunnel ($rr/${RESUME_RETRY_MAX})...${C_RST}"; rnet=0
+            else
+                echo -e "${C_WARN}  [resume] lỗi khác — thử lại ($rr/${RESUME_RETRY_MAX})...${C_RST}"; sleep 3; continue
+            fi
+            rotate "resume" || { echo -e "${C_ERR}  [!] Rotation failed.${C_RST}"; break; }
+            [ "$TOKEN_RESET_ON_LIMIT" = "1" ] && token_reset quiet
+        done
 
     done
 }
