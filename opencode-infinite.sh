@@ -978,6 +978,10 @@ auto_rotate_loop() {
         fi
 
         echo -e "${C_WARN}  [!] Fatal/quota hit — rotating egress (try $tries)...${C_RST}"
+        local trig
+        trig="$(tail -300 "$LOGFILE" 2>/dev/null | grep -E "$OC_PAT" | tail -1 | cut -c1-220)"
+        [ -n "$trig" ] && echo "      Dòng log kích hoạt: $trig"
+        log "fatal trigger: ${trig:-none (rc=$rc)}" run
 
         if ! rotate "$tries"; then
             echo -e "${C_ERR}  [!] Rotation failed.${C_RST}"
