@@ -648,13 +648,8 @@ find_opencode() {
 }
 
 install_opencode() {
-    echo "    Installing opencode via npm..."
-    if ! have_cmd npm; then
-        echo "    npm not found, installing Node.js..."
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - >/dev/null 2>&1
-        sudo apt-get install -y nodejs >/dev/null 2>&1
-    fi
-    npm install -g @opencode/cli 2>&1 | tail -3
+    echo "    Installing opencode (official installer)..."
+    curl -fsSL https://opencode.ai/install | bash 2>&1 | tail -5
 }
 
 detect_caps() {
@@ -683,17 +678,9 @@ oc_update_check() {
         echo -n "        Update now? [Y/n]: "
         read -r ans
         if [[ "$ans" =~ ^[Yy]$|^$ ]]; then
-            if ! have_cmd npm; then
-                echo "  npm chưa có — đang cài Node.js (nodesource LTS)..."
-                curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - >/dev/null 2>&1
-                sudo apt-get install -y nodejs >/dev/null 2>&1
-            fi
-            if have_cmd npm; then
-                npm install -g @opencode/cli 2>&1 | tail -3
-                find_opencode
-            else
-                echo -e "${C_ERR}  [!] Không cài được npm, bỏ qua update.${C_RST}"
-            fi
+            echo "  Đang nâng cấp bằng: $OC_CMD upgrade"
+            "$OC_CMD" upgrade 2>&1 | tail -5 || true
+            find_opencode
         fi
     fi
 }
