@@ -374,7 +374,7 @@ wait_warp_ready() {
 # Dải IP đã bị limit (WARP cấp IP khác nhau nhưng cùng /64 → server limit cả dải)
 # ---------------------------------------------------------------
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
-BURN_TTL=86400          # nhớ dải bị limit trong 24h
+BURN_TTL="${BURN_TTL:-600}"   # giây nhớ dải bị limit (mặc định 10 phút; dải tự hết hạn, không cần xoá tay)
 BURN_REROLL_MAX=0       # số lần đổi lại tối đa để ra khỏi dải đã burn (0 = vô hạn)
 
 ip_prefix() {
