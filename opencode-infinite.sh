@@ -355,7 +355,39 @@ wait_warp_ready() {
     return 1
 }
 
-warp_rotate() {
+warp_# ---------------------------------------------------------------
+# Dải IP đã bị limit (WARP cấp IP khác nhau nhưng cùng /64 → server limit cả dải)
+# ---------------------------------------------------------------
+BURN_FILE="$STATE_DIR/burned_prefixes.txt"
+BURN_TTL=86400          # nhớ dải bị limit trong 24h
+BURN_REROLL_MAX=8       # số lần đổi lại tối đa để ra khỏi dải đã burn
+
+ip_prefix() {
+    local ip="${1:-}"
+    case "$ip" in
+        *:*) echo "$ip" | cut -d: -f1-4 ;;
+        *.*) echo "$ip" | cut -d. -f1-3 ;;
+        *)   echo "" ;;
+    esac
+}
+
+burn_mark() {
+    local p; p="$(ip_prefix "${1:-}")"
+    [ -z "$p" ] && return 0
+    mkdir -p "$STATE_DIR"
+    echo "$(date +%s) $p" >> "$BURN_FILE" 2>/dev/null || true
+    log "burn mark prefix=$p" burn
+    return 0
+}
+
+burn_is() {
+    local p; p="$(ip_prefix "${1:-}")"
+    [ -z "$p" ] && return 1
+    [ -f "$BURN_FILE" ] || return 1
+    awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$1 > n - t && $2 == p { f = 1 } END { exit !f }' "$BURN_FILE"
+}
+
+rotate() {
     log "warp_rotate: start" warp
     warp_cmd disconnect
     warp_cmd registration delete
@@ -872,6 +904,15 @@ rotate() {
         sleep "$ROTATE_COOLDOWN"
         wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
+        local reroll=0
+        while burn_is "$IP" && [ "$reroll" -lt "$BURN_REROLL_MAX" ]; do
+            reroll=$(( reroll + 1 ))
+            echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp ($reroll/$BURN_REROLL_MAX)..."
+            warp_rotate
+            sleep "$ROTATE_COOLDOWN"
+            wait_warp_ready "$ACTIVE_PROXY" || true
+            get_ip "$ACTIVE_PROXY"
+        done
         echo "    New IP: ${IP:-unknown}"
         ;;
     TOR)
@@ -960,11 +1001,11 @@ auto_rotate_loop() {
     fi
 
     while true; do
-        run_opencode "$runargs"
-        local rc=$?
+        local rc=0
+        run_opencode "$runargs" || rc=$?
 
         # check if a fatal/quota line was seen
-        scan_log
+        scan_log || true
         local fatal="${FHIT:-}${QHIT:-}"
 
         if [ -z "$fatal" ]; then
@@ -1000,6 +1041,7 @@ auto_rotate_loop() {
         fi
 
         echo -e "${C_WARN}  [!] Fatal/quota hit — rotating egress (try $tries)...${C_RST}"
+        burn_mark "$IP"
         local trig
         trig="$(tail -300 "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1 | cut -c1-220)"
         [ -n "$trig" ] && echo "      Dòng log kích hoạt: $trig"
@@ -1022,7 +1064,7 @@ auto_rotate_loop() {
             local burned=0
             local find_tries=0
             while true; do
-                local pr; probe_ip "$ACTIVE_PROXY"; pr=$?
+                local pr=0; probe_ip "$ACTIVE_PROXY" || pr=$?
                 if [ "$pr" -eq 0 ]; then
                     probe_ok=true; break
                 elif [ "$pr" -eq 1 ]; then
