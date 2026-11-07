@@ -1113,9 +1113,10 @@ token_reset() {
     find "$DATA_DIR" \( -name "*.token" -o -name "credentials*" \) -exec rm -f {} + 2>/dev/null || true
     rm -rf "$cache_dir" 2>/dev/null || true
     # chỉ giữ 5 backup gần nhất
-    ls -1t "$STATE_DIR"/auth-backup/auth-*.json 2>/dev/null | tail -n +6 | xargs -r rm -f
+    { ls -1t "$STATE_DIR"/auth-backup/auth-*.json 2>/dev/null | tail -n +6 | xargs -r rm -f; } || true
     [ "${1:-}" = "quiet" ] || echo "  Cache + token đã xoá (backup auth.json trong $STATE_DIR/auth-backup). Chat giữ nguyên."
     log "token reset ${1:-} cache=$cache_dir" reset
+    return 0
 }
 
 # ---------------------------------------------------------------
