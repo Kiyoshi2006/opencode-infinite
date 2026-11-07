@@ -1079,12 +1079,21 @@ deep_reset() {
 }
 
 token_reset() {
-    pkill -f "opencode.*service\|opencode.*server" 2>/dev/null || true
-    # Remove auth/token files but keep chats
-    find "$DATA_DIR" \( -name "*.token" -o -name "auth.json" -o -name "credentials*" \) \
-        -exec rm -f {} + 2>/dev/null || true
-    [ "${1:-}" = "quiet" ] || echo "  Tokens cleared. Chats untouched."
-    log "token reset ${1:-}" reset
+    pkill -x opencode 2>/dev/null || true
+    # Giống bản Windows (:clear_tokens): xoá cache + auth.json, giữ chat.
+    # auth.json được backup trước khi xoá.
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/opencode"
+    mkdir -p "$STATE_DIR/auth-backup"
+    if [ -f "$DATA_DIR/auth.json" ]; then
+        cp -f "$DATA_DIR/auth.json" "$STATE_DIR/auth-backup/auth-$(date +%Y%m%d-%H%M%S).json" 2>/dev/null || true
+        rm -f "$DATA_DIR/auth.json"
+    fi
+    find "$DATA_DIR" \( -name "*.token" -o -name "credentials*" \) -exec rm -f {} + 2>/dev/null || true
+    rm -rf "$cache_dir" 2>/dev/null || true
+    # chỉ giữ 5 backup gần nhất
+    ls -1t "$STATE_DIR"/auth-backup/auth-*.json 2>/dev/null | tail -n +6 | xargs -r rm -f
+    [ "${1:-}" = "quiet" ] || echo "  Cache + token đã xoá (backup auth.json trong $STATE_DIR/auth-backup). Chat giữ nguyên."
+    log "token reset ${1:-} cache=$cache_dir" reset
 }
 
 # ---------------------------------------------------------------
