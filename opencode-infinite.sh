@@ -275,7 +275,9 @@ warp_cmd() {
     local out
     out="$(printf 'y\n' | timeout "$WARP_CALL_TIMEOUT" "$WARP_BIN" "$@" \
         2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || true)"
+    WARP_LAST="$out"
     [ -n "$out" ] && log "warp_cmd $*: $out" warp
+    return 0
 }
 
 # Kết nối WARP proxy mode (chỉ gọi khi đã qua warp_check_tunnel_danger)
@@ -406,7 +408,12 @@ warp_rotate() {
     warp_cmd registration delete
     sleep 2
     warp_cmd --accept-tos registration new
-    log "warp rotate: registration done" warp
+    REG_FAIL=0
+    if echo "${WARP_LAST:-}" | grep -qiE 'error|fail|too many|rate|limit|unable'; then
+        REG_FAIL=1
+        echo "    [warp] registration new báo lỗi: $(echo "$WARP_LAST" | head -c 160)"
+    fi
+    log "warp rotate: registration done fail=$REG_FAIL" warp
     sleep "$ROTATE_COOLDOWN"
     # PHẢI set proxy mode trước khi connect (tránh tunnel mode → mất SSH)
     warp_cmd mode proxy
@@ -999,6 +1006,7 @@ rotate() {
             echo -e "${C_WARN}  [!] WARP not available — cannot rotate.${C_RST}"
             return 1
         fi
+        local prev_ip="${IP:-}" same=0
         warp_rotate
         sleep "$ROTATE_COOLDOWN"
         wait_warp_ready "$ACTIVE_PROXY" || true
@@ -1007,10 +1015,19 @@ rotate() {
         while burn_is "$IP" && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
             reroll=$(( reroll + 1 ))
             echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."
+            prev_ip="$IP"
             warp_rotate
             sleep "$ROTATE_COOLDOWN"
             wait_warp_ready "$ACTIVE_PROXY" || true
             get_ip "$ACTIVE_PROXY"
+            if [ -n "$IP" ] && [ "$IP" = "$prev_ip" ]; then
+                same=$(( same + 1 ))
+                local w=$(( same * 20 )); [ "$w" -gt 120 ] && w=120
+                echo "    [warp] vẫn IP cũ (WARP không cấp IP mới — có thể bị giới hạn đăng ký). Chờ ${w}s rồi thử lại..."
+                sleep "$w"
+            else
+                same=0
+            fi
         done
         echo "    New IP: ${IP:-unknown}"
         ;;
@@ -1313,7 +1330,7 @@ deep_reset() {
     echo -n "    Continue? [y/N]: "
     read -r ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
-    pkill -f opencode 2>/dev/null || true
+    pkill -x opencode 2>/dev/null || true   # -x: KHÔNG dùng -f (sẽ giết luôn chính script opencode-infinite.sh)
     local dest
     dest=~/Desktop/opencode-backup-"$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$dest"
