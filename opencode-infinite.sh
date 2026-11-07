@@ -89,7 +89,8 @@ OPFOLDER=""
 APP_MODE="CLI"
 
 # fatal-line pattern (grep -E)
-OC_PAT='level=ERROR.*(Failed to drain Session|free usage limit|usage limit reached|rate limit|out of usage|insufficient credits|payment required)'
+# Không phân biệt hoa/thường (OpenCode 2.x in "Free usage limit reached"), không đòi level=ERROR.
+OC_PAT='(Failed to drain Session|free usage limit|usage limit reached|rate limit|out of usage|insufficient credits|payment required)'
 
 # ---------------------------------------------------------------
 # COLOUR
@@ -818,7 +819,7 @@ watch_start() {
     # → vòng lặp chính tự xoay IP + xoá token + resume. Không cần bấm Ctrl+C.
     (
         tail -F -n 0 "$LOGFILE" 2>/dev/null | \
-        grep -m1 --line-buffered -E "$OC_PAT" >/dev/null 2>&1
+        grep -m1 --line-buffered -iE "$OC_PAT" >/dev/null 2>&1
         touch "$FATAL_FLAG"
         sleep 3                       # cho OpenCode kịp ghi/hiển thị lỗi
         pkill -TERM -x opencode 2>/dev/null || true
@@ -846,7 +847,7 @@ scan_log() {
     # Lọc theo file modification time: chỉ xét nếu log được sửa gần đây
     local log_mt; log_mt="$(stat -c %Y "$LOGFILE" 2>/dev/null || echo 0)"
     [ "$log_mt" -lt "$since" ] && return 1
-    if tail -200 "$LOGFILE" 2>/dev/null | grep -qE "$OC_PAT"; then
+    if tail -200 "$LOGFILE" 2>/dev/null | grep -qiE "$OC_PAT"; then
         QHIT=1; return 0
     fi
     return 1
@@ -1000,7 +1001,7 @@ auto_rotate_loop() {
 
         echo -e "${C_WARN}  [!] Fatal/quota hit — rotating egress (try $tries)...${C_RST}"
         local trig
-        trig="$(tail -300 "$LOGFILE" 2>/dev/null | grep -E "$OC_PAT" | tail -1 | cut -c1-220)"
+        trig="$(tail -300 "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1 | cut -c1-220)"
         [ -n "$trig" ] && echo "      Dòng log kích hoạt: $trig"
         log "fatal trigger: ${trig:-none (rc=$rc)}" run
 
