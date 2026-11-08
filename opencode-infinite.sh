@@ -1355,7 +1355,7 @@ deep_reset() {
 }
 
 token_reset() {
-    pkill -x opencode 2>/dev/null || true
+    [ "${GUARD_NOKILL:-0}" = "1" ] || pkill -x opencode 2>/dev/null || true
     # Giống bản Windows (:clear_tokens): xoá cache + auth.json, giữ chat.
     # auth.json được backup trước khi xoá.
     local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/opencode"
@@ -1464,6 +1464,7 @@ guard_main() {
     find_opencode
     [ -z "$OC_CMD" ] && { echo "guard: không tìm thấy opencode" >&2; exit 1; }
     detect_caps
+    [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] || GUARD_NOKILL=1   # không giết/dựng lại server mỗi lần xoay
     CAP_STANDALONE=""     # PHẢI dùng server dùng chung (để Telegram thấy), không dùng server riêng
     EGRESS=WARP
     find_warp
@@ -1506,7 +1507,7 @@ guard_main() {
             rotate "guard" || true
             rm -f "$STATE_DIR/rotating.flag"
             token_reset quiet
-            guard_start_service
+            [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] && guard_start_service
             for s in $sids; do guard_resume_sid "$s"; done
             last_act="$(date +%s)"; bot_pending=1
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
@@ -1523,7 +1524,7 @@ guard_main() {
                 [ "$net_steps" -eq 2 ] && warp_switch_path
                 warp_heal || true
             fi
-            guard_start_service
+            [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] && guard_start_service
             for s in $sids; do guard_resume_sid "$s"; done
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
         else
