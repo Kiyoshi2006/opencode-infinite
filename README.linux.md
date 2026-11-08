@@ -251,3 +251,15 @@ cat ~/.local/share/opencode-infinite/wcli.log
 - Script gốc: [jeko1107/opencode-infinite](https://github.com/jeko1107/opencode-infinite) (Windows)
 - Fork & thêm tính năng: [Kiyoshi2006/opencode-infinite](https://github.com/Kiyoshi2006/opencode-infinite)
 - Port sang Linux/Ubuntu: branch `linux` của repo này
+
+## Chạy nền (Telegram / đóng SSH vẫn tự xoay IP + continue)
+
+```bash
+rm -f ~/opencode-infinite.sh && curl -fsSL <URL script> -o ~/opencode-infinite.sh && chmod +x ~/opencode-infinite.sh
+~/opencode-infinite.sh --guard-install     # cài dịch vụ nền (systemd user + linger)
+journalctl --user -u opencode-guard -f     # xem log
+~/opencode-infinite.sh --guard-uninstall   # gỡ
+```
+
+Người gác canh log của server OpenCode dùng chung (Telegram bot + TUI). Session nào dính limit thì xoay IP WARP, xoá token, dựng lại server qua proxy WARP, rồi gửi `continue` vào đúng session đó (`--session <id>`).
+Khi guard chạy, menu SSH không tự xoay nữa; mở OpenCode xong chọn session bằng `/sessions`.

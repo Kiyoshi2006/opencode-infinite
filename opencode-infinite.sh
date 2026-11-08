@@ -374,7 +374,7 @@ wait_warp_ready() {
 # Dải IP đã bị limit (WARP cấp IP khác nhau nhưng cùng /64 → server limit cả dải)
 # ---------------------------------------------------------------
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
-BURN_TTL="${BURN_TTL:-86400}"   # dự phòng (giây) khi log không ghi giờ mở lại; nếu có "They reset at ..." thì dùng giờ đó +1 phút
+BURN_TTL=86400          # nhớ dải bị limit trong 24h
 BURN_REROLL_MAX=0       # số lần đổi lại tối đa để ra khỏi dải đã burn (0 = vô hạn)
 
 ip_prefix() {
@@ -386,24 +386,12 @@ ip_prefix() {
     esac
 }
 
-# Đọc giờ mở lại từ câu "They reset at 12:13 AM · 11/8/2026" → epoch (+60s); rỗng nếu không có
-reset_epoch() {
-    local t d e
-    t="$(echo "${1:-}" | tr '\n' ' ' | grep -oiE 'reset at[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*[AP]M[[:space:]]*[^0-9]*[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}' | tail -1)"
-    [ -z "$t" ] && return 0
-    d="$(echo "$t" | grep -oE '[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}')"
-    t="$(echo "$t" | grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[AP]M')"
-    e="$(date -d "$d $t" +%s 2>/dev/null || true)"
-    [ -n "$e" ] && echo $(( e + 60 ))
-    return 0
-}
 burn_mark() {
     local p; p="$(ip_prefix "${1:-}")"
     [ -z "$p" ] && return 0
-    local exp="${2:-}"
     mkdir -p "$STATE_DIR"
-    echo "$(date +%s) $p $exp" >> "$BURN_FILE" 2>/dev/null || true
-    log "burn mark prefix=$p expiry=${exp:-ttl}" burn
+    echo "$(date +%s) $p" >> "$BURN_FILE" 2>/dev/null || true
+    log "burn mark prefix=$p" burn
     return 0
 }
 
@@ -411,7 +399,7 @@ burn_is() {
     local p; p="$(ip_prefix "${1:-}")"
     [ -z "$p" ] && return 1
     [ -f "$BURN_FILE" ] || return 1
-    awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$2 == p { if ($3 != "") { if ($3 > n) f = 1 } else if ($1 > n - t) f = 1 } END { exit !f }' "$BURN_FILE"
+    awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$1 > n - t && $2 == p { f = 1 } END { exit !f }' "$BURN_FILE"
 }
 
 warp_rotate() {
@@ -770,8 +758,8 @@ detect_caps() {
     echo "$run_help" | grep -q -- '--continue' && CAP_RUN_CONTINUE="--continue"
     echo "$run_help" | grep -q -- '--session'  && CAP_RUN_SESSION="--session"
     # cờ tự duyệt quyền: tuỳ phiên bản, chỉ dùng nếu help có liệt kê
-    for f in --auto-approve --dangerously-skip-permissions --yolo --allow-all --yes; do
-        if echo "$run_help" | grep -q -- "$f"; then CAP_AUTOFLAG="$f"; break; fi
+    for f in --auto-approve --dangerously-skip-permissions --yolo --allow-all --yes --auto; do
+        if echo "$run_help" | grep -qE -- "$f( |,|$)"; then CAP_AUTOFLAG="$f"; break; fi
     done
     echo "$top_help" | grep -q -- '--session' && CAP_TUI_SESSION="--session"
     echo "$top_help" | grep -q -- '--prompt'  && CAP_TUI_PROMPT=1
@@ -879,6 +867,12 @@ probe_ip() {
 # ---------------------------------------------------------------
 watch_pid=""
 
+GUARD_PID_FILE="$STATE_DIR/guard.pid"
+guard_active() {
+    local pid; pid="$(cat "$GUARD_PID_FILE" 2>/dev/null || echo 0)"
+    [ "${pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null && tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null | grep -q -- '--guard'
+}
+
 FATAL_FLAG="$STATE_DIR/fatal.flag"
 NET_FLAG="$STATE_DIR/net.flag"
 HIT_FATAL="$STATE_DIR/hit.fatal"
@@ -940,6 +934,7 @@ health_stop() {
 
 watch_start() {
     [ "$WATCH" = "1" ] || return 0
+    guard_active && return 0      # người gác nền lo việc xoay IP/continue — tránh hai bên giành nhau
     [ -z "$LOGFILE" ] && return 0
     QHIT=""; FHIT=""; NETHIT=""
     mkdir -p "$STATE_DIR"
@@ -1115,7 +1110,7 @@ run_opencode() {
 
     local rc=0
     local -a extra=()
-    if [ -n "${RESUME:-}" ]; then
+    if [ -n "${RESUME:-}" ] && ! guard_active; then
         if [ -n "$LAST_SID" ] && [ -n "$CAP_TUI_SESSION" ]; then
             extra+=("$CAP_TUI_SESSION" "$LAST_SID")
         else
@@ -1146,6 +1141,8 @@ run_opencode() {
 auto_rotate_loop() {
     local runargs="${1:-}"
     local tries=0 netfails=0
+    local GUARDED=0
+    guard_active && GUARDED=1
 
     # Kết nối egress lần đầu (nếu chưa kết nối)
     if [ "$WARP_UP" = "0" ] || [ -z "$ACTIVE_PROXY" -a "$EGRESS" != "NONE" ]; then
@@ -1157,6 +1154,10 @@ auto_rotate_loop() {
     while true; do
         local rc=0
         run_opencode "$runargs" || rc=$?
+        if [ "$GUARDED" = "1" ]; then
+            echo -e "${C_CYAN}  [guard] Người gác nền đang lo xoay IP/continue — về menu. Mở lại chọn session trong OpenCode (/sessions).${C_RST}"
+            return 0
+        fi
 
         # check if a fatal/quota line was seen
         scan_log || true
@@ -1215,17 +1216,13 @@ auto_rotate_loop() {
         fi
 
         echo -e "${C_WARN}  [!] Fatal/quota hit — rotating egress (try $tries)...${C_RST}"
+        burn_mark "$IP"
         local sid
         sid="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -oE 'sessionID=ses_[A-Za-z0-9]+' | tail -1 | cut -d= -f2)"
         [ -n "$sid" ] && LAST_SID="$sid"
         local trig
         trig="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1 | cut -c1-220)"
         [ -n "$trig" ] && echo "      Dòng log kích hoạt: $trig"
-        local rfull rexp
-        rfull="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1)"
-        rexp="$(reset_epoch "$rfull")"
-        if [ -n "$rexp" ]; then echo "      Dải IP này mở lại lúc: $(date -d @"$rexp" '+%H:%M %d/%m') (đã +1 phút)"; fi
-        burn_mark "$IP" "$rexp"
         log "fatal trigger: ${trig:-none (rc=$rc)}" run
 
         if ! rotate "$tries"; then
@@ -1375,6 +1372,159 @@ token_reset() {
     return 0
 }
 
+
+# ---------------------------------------------------------------
+# GUARD — dịch vụ nền: canh log server OpenCode (Telegram + SSH dùng chung),
+# dính limit thì xoay IP, xoá token, restart server (qua proxy WARP)
+# rồi gửi "continue" vào ĐÚNG session bị limit (--session <id>), không dùng --continue.
+# ---------------------------------------------------------------
+GUARD_POLL=5
+GUARD_RESUME_PIDS=""
+
+guard_service_pid() { pgrep -f 'opencode serve --service' 2>/dev/null | head -1 || true; }
+
+guard_start_service() {
+    pkill -f 'opencode serve --service' 2>/dev/null || true
+    sleep 2
+    local env_args=()
+    if [ -n "$ACTIVE_PROXY" ]; then
+        env_args=(HTTP_PROXY="$ACTIVE_PROXY" HTTPS_PROXY="$ACTIVE_PROXY" http_proxy="$ACTIVE_PROXY" https_proxy="$ACTIVE_PROXY" NO_PROXY="$NO_PROXY_LIST" no_proxy="$NO_PROXY_LIST")
+    fi
+    ( cd "$HOME" && setsid nohup env "${env_args[@]}" "$OC_CMD" serve --service >>"$STATE_DIR/service.log" 2>&1 </dev/null & ) || true
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -n "$(guard_service_pid)" ] && break
+        sleep 2
+    done
+    log "guard: service pid=$(guard_service_pid)" guard
+    return 0
+}
+
+guard_kill_resumes() {
+    local p
+    for p in $GUARD_RESUME_PIDS; do kill "$p" 2>/dev/null || true; done
+    GUARD_RESUME_PIDS=""
+}
+
+guard_resume_sid() {
+    local sid="$1"
+    local -a a=(run)
+    [ -n "$CAP_AUTOFLAG" ] && [ "${RESUME_AUTO:-0}" = "1" ] && a+=("$CAP_AUTOFLAG")
+    a+=(--session "$sid" "$RESUME_MSG")
+    echo "[$(date '+%H:%M:%S')] gửi \"$RESUME_MSG\" -> $sid"
+    log "guard resume: ${a[*]}" guard
+    ( cd "$HOME" && run_cmd_proxy "$ACTIVE_PROXY" "$OC_CMD" "${a[@]}" >"$STATE_DIR/resume-$sid.log" 2>&1 </dev/null ) &
+    GUARD_RESUME_PIDS="$GUARD_RESUME_PIDS $!"
+    sleep 2
+}
+
+guard_main() {
+    mkdir -p "$STATE_DIR"
+    trap 'rm -f "$GUARD_PID_FILE"; health_stop; exit 0' TERM INT
+    trap 'rm -f "$GUARD_PID_FILE"' EXIT
+    echo "$$" > "$GUARD_PID_FILE"
+    find_opencode
+    [ -z "$OC_CMD" ] && { echo "guard: không tìm thấy opencode" >&2; exit 1; }
+    detect_caps
+    CAP_STANDALONE=""     # PHẢI dùng server dùng chung (để Telegram thấy), không dùng server riêng
+    EGRESS=WARP
+    find_warp
+    [ -z "$WARP_BIN" ] && { echo "guard: chưa cài WARP" >&2; exit 1; }
+    warp_check_tunnel_danger || exit 1
+    egress_connect || exit 1
+    WARP_UP=1
+    echo "[guard] chạy. IP=$IP proxy=$ACTIVE_PROXY log=$LOGFILE"
+    log "guard start ip=$IP" guard
+    # server phải chạy qua proxy WARP: nếu chưa có thì dựng lại
+    if [ -z "$(guard_service_pid)" ]; then guard_start_service; fi
+    health_start
+
+    local off size chunk hits sids net_steps=0
+    off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
+    while true; do
+        sleep "$GUARD_POLL"
+        [ -f "$LOGFILE" ] || continue
+        size="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
+        [ "$size" -lt "$off" ] && off=0
+        [ "$size" -le "$off" ] && continue
+        chunk="$(tail -c +$(( off + 1 )) "$LOGFILE" 2>/dev/null | head -c 4000000 || true)"
+        off="$size"
+
+        hits="$(echo "$chunk" | grep -iE "$OC_PAT" || true)"
+        if [ -n "$hits" ]; then
+            sleep 3
+            chunk="${chunk}"$'\n'"$(tail -c +$(( off + 1 )) "$LOGFILE" 2>/dev/null | head -c 1000000 || true)"
+            off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo "$off")"
+            hits="$(echo "$chunk" | grep -iE "$OC_PAT" || true)"
+            sids="$(echo "$hits" | grep -oE 'sessionID=ses_[A-Za-z0-9]+' | cut -d= -f2 | sort -u || true)"
+            echo "[$(date '+%H:%M:%S')] LIMIT — session: ${sids:-không rõ}"
+            net_steps=0
+            guard_kill_resumes
+            burn_mark "$IP"
+            rotate "guard" || true
+            token_reset quiet
+            guard_start_service
+            for s in $sids; do guard_resume_sid "$s"; done
+            off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
+            continue
+        fi
+
+        if [ "$(echo "$chunk" | grep -ciE "$NET_PAT" || true)" -ge "$NET_HITS_MAX" ]; then
+            net_steps=$(( net_steps + 1 ))
+            sids="$(echo "$chunk" | grep -iE "$NET_PAT" | grep -oE 'sessionID=ses_[A-Za-z0-9]+' | cut -d= -f2 | sort -u || true)"
+            echo "[$(date '+%H:%M:%S')] LỖI MẠNG lặp lại (bước $net_steps) — session: ${sids:-không rõ}"
+            guard_kill_resumes
+            if [ "$net_steps" -ge 3 ]; then rotate "guard-net" || true; token_reset quiet; net_steps=0
+            else
+                [ "$net_steps" -eq 2 ] && warp_switch_path
+                warp_heal || true
+            fi
+            guard_start_service
+            for s in $sids; do guard_resume_sid "$s"; done
+            off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
+        else
+            net_steps=0
+        fi
+    done
+}
+
+guard_install() {
+    local unit_dir="$HOME/.config/systemd/user" me="$HOME/opencode-infinite.sh"
+    [ -f "$me" ] || cp -f "$SCRIPT_PATH" "$me"
+    chmod +x "$me"
+    mkdir -p "$unit_dir"
+    cat > "$unit_dir/opencode-guard.service" <<UNIT
+[Unit]
+Description=OpenCode Infinite guard (auto rotate WARP + continue)
+After=network-online.target
+
+[Service]
+ExecStart=$me --guard
+Restart=always
+RestartSec=10
+Environment=PATH=$HOME/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now opencode-guard.service
+    if loginctl enable-linger "$USER" 2>/dev/null; then
+        echo "  [ok] linger bật — đóng SSH vẫn chạy."
+    else
+        echo "  [!] Chạy thêm: sudo loginctl enable-linger $USER   (để đóng SSH vẫn chạy)"
+    fi
+    echo "  Xem trạng thái: systemctl --user status opencode-guard"
+    echo "  Xem log      : journalctl --user -u opencode-guard -f"
+}
+
+guard_uninstall() {
+    systemctl --user disable --now opencode-guard.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/opencode-guard.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "  Đã gỡ guard."
+}
+
 # ---------------------------------------------------------------
 # MAIN MENU
 # ---------------------------------------------------------------
@@ -1456,6 +1606,11 @@ main() {
     mkdir -p "$STATE_DIR"
     trim_log "$LAUNCHER_LOG" "$LOG_MAX_KB"
     log "start v$VERSION args=$*" boot
+    case "${1:-}" in
+        --guard)           guard_main; return ;;
+        --guard-install)   guard_install; return ;;
+        --guard-uninstall) guard_uninstall; return ;;
+    esac
     lock_check
 
     [ "$UPDATE_CHECK" = "1" ] && self_update "$@"
