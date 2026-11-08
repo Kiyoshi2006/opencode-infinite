@@ -1464,8 +1464,8 @@ guard_main() {
             guard_kill_resumes
             local now; now="$(date +%s)"
             if [ $(( now - ${last_act:-0} )) -lt 180 ]; then streak=$(( ${streak:-0} + 1 )); else streak=0; fi
-            if [ "$streak" -ge 2 ]; then
-                local w=$(( streak * 45 )); [ "$w" -gt 900 ] && w=900
+            if [ "$streak" -ge 5 ]; then
+                local w=$(( (streak - 4) * 20 )); [ "$w" -gt 240 ] && w=240
                 echo "[$(date '+%H:%M:%S')] limit liên tiếp $streak lần — IP mới vẫn bị limit ngay; chờ ${w}s rồi mới xoay tiếp (tránh Cloudflare chặn đăng ký)"
                 log "guard backoff streak=$streak wait=$w" guard
                 sleep "$w"
