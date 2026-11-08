@@ -389,7 +389,7 @@ ip_prefix() {
 # Đọc giờ mở lại từ câu "They reset at 12:13 AM · 11/8/2026" → epoch (+60s); rỗng nếu không có
 reset_epoch() {
     local t d e
-    t="$(echo "${1:-}" | grep -oiE 'reset at[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*[AP]M[[:space:]]*[^0-9]*[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}' | tail -1)"
+    t="$(echo "${1:-}" | tr '\n' ' ' | grep -oiE 'reset at[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*[AP]M[[:space:]]*[^0-9]*[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}' | tail -1)"
     [ -z "$t" ] && return 0
     d="$(echo "$t" | grep -oE '[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}')"
     t="$(echo "$t" | grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[AP]M')"
