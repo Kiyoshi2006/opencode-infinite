@@ -914,6 +914,7 @@ health_start() {
         fails=0
         while true; do
             sleep "$HEALTH_INTERVAL"
+            [ -f "$STATE_DIR/rotating.flag" ] && { fails=0; continue; }
             t="$(curl -s -m 8 --proxy "$ACTIVE_PROXY" "$TRACE_URL" 2>/dev/null || true)"
             if echo "$t" | grep -qE '^warp=(on|plus)'; then fails=0; continue; fi
             fails=$(( fails + 1 ))
@@ -1396,7 +1397,8 @@ guard_start_service() {
         [ -n "$(guard_service_pid)" ] && break
         sleep 2
     done
-    log "guard: service pid=$(guard_service_pid)" guard
+    local sp; sp="$(guard_service_pid)"
+    log "guard: service pid=$sp proxy_env=$(tr '\0' '\n' </proc/${sp:-0}/environ 2>/dev/null | grep -i '^https_proxy=' | head -1)" guard
     return 0
 }
 
@@ -1439,7 +1441,7 @@ guard_main() {
     if [ -z "$(guard_service_pid)" ]; then guard_start_service; fi
     health_start
 
-    local off size chunk hits sids net_steps=0
+    local off size chunk hits sids net_steps=0 last_act=0 streak=0
     off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
     while true; do
         sleep "$GUARD_POLL"
@@ -1460,11 +1462,22 @@ guard_main() {
             echo "[$(date '+%H:%M:%S')] LIMIT — session: ${sids:-không rõ}"
             net_steps=0
             guard_kill_resumes
+            local now; now="$(date +%s)"
+            if [ $(( now - ${last_act:-0} )) -lt 180 ]; then streak=$(( ${streak:-0} + 1 )); else streak=0; fi
+            if [ "$streak" -ge 2 ]; then
+                local w=$(( streak * 45 )); [ "$w" -gt 900 ] && w=900
+                echo "[$(date '+%H:%M:%S')] limit liên tiếp $streak lần — IP mới vẫn bị limit ngay; chờ ${w}s rồi mới xoay tiếp (tránh Cloudflare chặn đăng ký)"
+                log "guard backoff streak=$streak wait=$w" guard
+                sleep "$w"
+            fi
             burn_mark "$IP"
+            touch "$STATE_DIR/rotating.flag"
             rotate "guard" || true
+            rm -f "$STATE_DIR/rotating.flag"
             token_reset quiet
             guard_start_service
             for s in $sids; do guard_resume_sid "$s"; done
+            last_act="$(date +%s)"
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
             continue
         fi
