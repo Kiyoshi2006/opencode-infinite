@@ -374,7 +374,7 @@ wait_warp_ready() {
 # Dải IP đã bị limit (WARP cấp IP khác nhau nhưng cùng /64 → server limit cả dải)
 # ---------------------------------------------------------------
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
-BURN_TTL="${BURN_TTL:-600}"   # giây nhớ dải bị limit (mặc định 10 phút; dải tự hết hạn, không cần xoá tay)
+BURN_TTL="${BURN_TTL:-86400}"   # dự phòng (giây) khi log không ghi giờ mở lại; nếu có "They reset at ..." thì dùng giờ đó +1 phút
 BURN_REROLL_MAX=0       # số lần đổi lại tối đa để ra khỏi dải đã burn (0 = vô hạn)
 
 ip_prefix() {
@@ -386,12 +386,24 @@ ip_prefix() {
     esac
 }
 
+# Đọc giờ mở lại từ câu "They reset at 12:13 AM · 11/8/2026" → epoch (+60s); rỗng nếu không có
+reset_epoch() {
+    local t d e
+    t="$(echo "${1:-}" | grep -oiE 'reset at[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*[AP]M[[:space:]]*[^0-9]*[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}' | tail -1)"
+    [ -z "$t" ] && return 0
+    d="$(echo "$t" | grep -oE '[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}')"
+    t="$(echo "$t" | grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[AP]M')"
+    e="$(date -d "$d $t" +%s 2>/dev/null || true)"
+    [ -n "$e" ] && echo $(( e + 60 ))
+    return 0
+}
 burn_mark() {
     local p; p="$(ip_prefix "${1:-}")"
     [ -z "$p" ] && return 0
+    local exp="${2:-}"
     mkdir -p "$STATE_DIR"
-    echo "$(date +%s) $p" >> "$BURN_FILE" 2>/dev/null || true
-    log "burn mark prefix=$p" burn
+    echo "$(date +%s) $p $exp" >> "$BURN_FILE" 2>/dev/null || true
+    log "burn mark prefix=$p expiry=${exp:-ttl}" burn
     return 0
 }
 
@@ -399,7 +411,7 @@ burn_is() {
     local p; p="$(ip_prefix "${1:-}")"
     [ -z "$p" ] && return 1
     [ -f "$BURN_FILE" ] || return 1
-    awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$1 > n - t && $2 == p { f = 1 } END { exit !f }' "$BURN_FILE"
+    awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$2 == p { if ($3 != "") { if ($3 > n) f = 1 } else if ($1 > n - t) f = 1 } END { exit !f }' "$BURN_FILE"
 }
 
 warp_rotate() {
@@ -1203,13 +1215,17 @@ auto_rotate_loop() {
         fi
 
         echo -e "${C_WARN}  [!] Fatal/quota hit — rotating egress (try $tries)...${C_RST}"
-        burn_mark "$IP"
         local sid
         sid="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -oE 'sessionID=ses_[A-Za-z0-9]+' | tail -1 | cut -d= -f2)"
         [ -n "$sid" ] && LAST_SID="$sid"
         local trig
         trig="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1 | cut -c1-220)"
         [ -n "$trig" ] && echo "      Dòng log kích hoạt: $trig"
+        local rfull rexp
+        rfull="$(tail -c +$(( ${LOG_RUN_OFF:-0} + 1 )) "$LOGFILE" 2>/dev/null | grep -iE "$OC_PAT" | tail -1)"
+        rexp="$(reset_epoch "$rfull")"
+        if [ -n "$rexp" ]; then echo "      Dải IP này mở lại lúc: $(date -d @"$rexp" '+%H:%M %d/%m') (đã +1 phút)"; fi
+        burn_mark "$IP" "$rexp"
         log "fatal trigger: ${trig:-none (rc=$rc)}" run
 
         if ! rotate "$tries"; then
