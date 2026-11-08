@@ -1405,6 +1405,12 @@ guard_start_service() {
 # Bot Telegram hay "kẹt" sau khi session bị limit giữa chừng → restart bot (đúng cách chạy hiện tại) khi session đã ổn
 guard_restart_bot() {
     [ "${BOT_RESTART:-1}" = "1" ] || return 0
+    if systemctl --user is-enabled opencode-telegram-bot >/dev/null 2>&1; then
+        systemctl --user restart opencode-telegram-bot 2>/dev/null || true
+        echo "[$(date '+%H:%M:%S')] đã restart bot Telegram (systemd)"
+        log "guard: bot restarted via systemd" guard
+        return 0
+    fi
     pgrep -f 'opencode-telegram start' >/dev/null 2>&1 || return 0
     local logd="$HOME/.config/opencode-telegram-bot/logs" blog n off i
     blog="$logd/bot-manual.log"; mkdir -p "$logd"
@@ -1556,6 +1562,35 @@ UNIT
     echo "  Xem log      : journalctl --user -u opencode-guard -f"
 }
 
+
+bot_install() {
+    local bin; bin="$(command -v opencode-telegram 2>/dev/null || echo /usr/local/bin/opencode-telegram)"
+    local unit_dir="$HOME/.config/systemd/user"; mkdir -p "$unit_dir"
+    pkill -f 'opencode-telegram start' 2>/dev/null || true
+    sleep 5
+    cat > "$unit_dir/opencode-telegram-bot.service" <<UNIT
+[Unit]
+Description=OpenCode Telegram bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=$HOME
+ExecStartPre=/bin/sleep 5
+ExecStart=$bin start
+Restart=always
+RestartSec=10
+Environment=PATH=$HOME/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now opencode-telegram-bot.service
+    loginctl enable-linger "$USER" 2>/dev/null || true
+    echo "  [ok] Bot Telegram chạy như dịch vụ nền (tự bật lại khi chết, sống khi đóng SSH)."
+    echo "  Trạng thái: systemctl --user status opencode-telegram-bot --no-pager"
+}
+
 guard_uninstall() {
     systemctl --user disable --now opencode-guard.service 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/opencode-guard.service"
@@ -1648,6 +1683,7 @@ main() {
         --guard)           guard_main; return ;;
         --guard-install)   guard_install; return ;;
         --guard-uninstall) guard_uninstall; return ;;
+        --bot-install)     bot_install; return ;;
     esac
     lock_check
 
