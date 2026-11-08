@@ -1402,6 +1402,20 @@ guard_start_service() {
     return 0
 }
 
+# Bot Telegram hay "kẹt" sau khi session bị limit giữa chừng → restart bot (đúng cách chạy hiện tại) khi session đã ổn
+guard_restart_bot() {
+    [ "${BOT_RESTART:-1}" = "1" ] || return 0
+    pgrep -f 'opencode-telegram start' >/dev/null 2>&1 || return 0
+    pkill -f 'opencode-telegram start' 2>/dev/null || true
+    sleep 2
+    local logd="$HOME/.config/opencode-telegram-bot/logs"
+    mkdir -p "$logd"
+    ( cd "$HOME" && setsid nohup opencode-telegram start >>"$logd/bot-manual.log" 2>&1 </dev/null & ) || true
+    echo "[$(date '+%H:%M:%S')] đã restart bot Telegram"
+    log "guard: bot restarted" guard
+    return 0
+}
+
 guard_kill_resumes() {
     local p
     for p in $GUARD_RESUME_PIDS; do kill "$p" 2>/dev/null || true; done
@@ -1441,10 +1455,13 @@ guard_main() {
     if [ -z "$(guard_service_pid)" ]; then guard_start_service; fi
     health_start
 
-    local off size chunk hits sids net_steps=0 last_act=0 streak=0
+    local off size chunk hits sids net_steps=0 last_act=0 streak=0 bot_pending=0
     off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
     while true; do
         sleep "$GUARD_POLL"
+        if [ "$bot_pending" = "1" ] && [ $(( $(date +%s) - last_act )) -ge 45 ]; then
+            guard_restart_bot; bot_pending=0
+        fi
         [ -f "$LOGFILE" ] || continue
         size="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
         [ "$size" -lt "$off" ] && off=0
@@ -1477,7 +1494,7 @@ guard_main() {
             token_reset quiet
             guard_start_service
             for s in $sids; do guard_resume_sid "$s"; done
-            last_act="$(date +%s)"
+            last_act="$(date +%s)"; bot_pending=1
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
             continue
         fi
