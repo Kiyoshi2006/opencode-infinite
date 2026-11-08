@@ -1479,19 +1479,39 @@ guard_main() {
     if [ -z "$(guard_service_pid)" ]; then guard_start_service; fi
     health_start
 
-    local off size chunk hits sids net_steps=0 last_act=0 streak=0 bot_pending=0
+    local off size chunk hits sids net_steps=0 last_act=0 streak=0 bot_pending=0 boff=0
+    BLOG_CUR=""
     off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
     while true; do
         sleep "$GUARD_POLL"
         if [ "$bot_pending" = "1" ] && [ $(( $(date +%s) - last_act )) -ge 45 ]; then
             guard_restart_bot; bot_pending=0
         fi
+        # Nguồn 2: log của bot Telegram báo "Session error: ses_xxx: Free usage limit" NGAY LÚC lỗi xảy ra
+        # (log server đôi khi ghi trễ cả phút) → phát hiện sớm + biết đúng session.
+        local bchunk="" bsize bf
+        bf="$(ls -t "$HOME"/.config/opencode-telegram-bot/logs/bot-2*.log 2>/dev/null | head -1 || true)"
+        if [ -n "$bf" ]; then
+            if [ "$bf" != "${BLOG_CUR:-}" ]; then BLOG_CUR="$bf"; boff="$(stat -c %s "$bf" 2>/dev/null || echo 0)"; fi
+            bsize="$(stat -c %s "$bf" 2>/dev/null || echo 0)"
+            [ "$bsize" -lt "${boff:-0}" ] && boff=0
+            if [ "$bsize" -gt "${boff:-0}" ]; then
+                bchunk="$(tail -c +$(( boff + 1 )) "$bf" 2>/dev/null | head -c 2000000 \
+                    | grep -E 'Session error: ses_[A-Za-z0-9]+: .*([Ff]ree usage limit|usage limit reached)' \
+                    | sed -E 's/.*Session error: (ses_[A-Za-z0-9]+): (.*)/message="Free usage limit reached" sessionID=\1 \2/' || true)"
+                boff="$bsize"
+            fi
+        fi
         [ -f "$LOGFILE" ] || continue
         size="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
         [ "$size" -lt "$off" ] && off=0
-        [ "$size" -le "$off" ] && continue
-        chunk="$(tail -c +$(( off + 1 )) "$LOGFILE" 2>/dev/null | head -c 4000000 || true)"
-        off="$size"
+        if [ "$size" -le "$off" ] && [ -z "$bchunk" ]; then continue; fi
+        chunk=""
+        if [ "$size" -gt "$off" ]; then
+            chunk="$(tail -c +$(( off + 1 )) "$LOGFILE" 2>/dev/null | head -c 4000000 || true)"
+            off="$size"
+        fi
+        [ -n "$bchunk" ] && chunk="${chunk}"$'\n'"${bchunk}"
 
         hits="$(echo "$chunk" | grep -iE "$OC_PAT" || true)"
         if [ -n "$hits" ]; then
@@ -1513,6 +1533,7 @@ guard_main() {
             for s in $sids; do guard_resume_sid "$s"; done
             last_act="$(date +%s)"
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
+            [ -n "${BLOG_CUR:-}" ] && boff="$(stat -c %s "$BLOG_CUR" 2>/dev/null || echo 0)"
             continue
         fi
 
