@@ -20,8 +20,8 @@ set -euo pipefail
 # ---------------------------------------------------------------
 ROTATE_TRIES_MAX=0          # số lần dính limit liên tiếp trước khi dừng (0 = vô hạn, Ctrl+C để dừng)
 IP_FIND_MAX=0               # 0 = hunt forever until a clean IP found
-WARP_WAIT=6                 # seconds after (re)connecting WARP
-ROTATE_COOLDOWN=10          # seconds between rotate attempts
+WARP_WAIT=2                 # seconds after (re)connecting WARP
+ROTATE_COOLDOWN=2          # seconds between rotate attempts
 AUTO_ROTATE=1               # 1 = auto-rotate on fatal log lines
 WARP_USE_BRIDGE=0          # 0 = dùng HTTP-proxy của WARP (:40000) như bản chạy tốt; 1 = ép qua bridge SOCKS5
 TOKEN_RESET_ON_LIMIT=1      # 1 = khi dính limit: xoay IP + xoá token (giữ chat) = gộp [7]+[1]
@@ -1379,7 +1379,7 @@ token_reset() {
 # dính limit thì xoay IP, xoá token, restart server (qua proxy WARP)
 # rồi gửi "continue" vào ĐÚNG session bị limit (--session <id>), không dùng --continue.
 # ---------------------------------------------------------------
-GUARD_POLL=5
+GUARD_POLL=2
 GUARD_RESUME_PIDS=""
 
 guard_service_pid() { pgrep -f 'opencode serve --service' 2>/dev/null | head -1 || true; }
@@ -1530,10 +1530,12 @@ guard_main() {
             token_reset quiet
             [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] && guard_start_service
             guard_restart_bot          # bot gắn lại TRƯỚC khi gửi continue → thấy continue và câu trả lời
-            for s in $sids; do guard_resume_sid "$s"; done
-            last_act="$(date +%s)"
+            # Đặt mốc đọc log NGAY TRƯỚC khi gửi continue: lỗi limit của chính lần continue này có thể tới sau vài giây,
+            # nếu đặt mốc sau khi gửi thì dòng lỗi bị nuốt và guard đứng im.
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
             [ -n "${BLOG_CUR:-}" ] && boff="$(stat -c %s "$BLOG_CUR" 2>/dev/null || echo 0)"
+            for s in $sids; do guard_resume_sid "$s"; done
+            last_act="$(date +%s)"
             continue
         fi
 
@@ -1549,8 +1551,9 @@ guard_main() {
             fi
             [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] && guard_start_service
             guard_restart_bot
-            for s in $sids; do guard_resume_sid "$s"; done
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
+            [ -n "${BLOG_CUR:-}" ] && boff="$(stat -c %s "$BLOG_CUR" 2>/dev/null || echo 0)"
+            for s in $sids; do guard_resume_sid "$s"; done
         else
             net_steps=0
         fi
