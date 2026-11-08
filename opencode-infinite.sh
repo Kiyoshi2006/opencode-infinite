@@ -1406,11 +1406,27 @@ guard_start_service() {
 guard_restart_bot() {
     [ "${BOT_RESTART:-1}" = "1" ] || return 0
     pgrep -f 'opencode-telegram start' >/dev/null 2>&1 || return 0
-    pkill -f 'opencode-telegram start' 2>/dev/null || true
-    sleep 2
-    local logd="$HOME/.config/opencode-telegram-bot/logs"
-    mkdir -p "$logd"
-    ( cd "$HOME" && setsid nohup opencode-telegram start >>"$logd/bot-manual.log" 2>&1 </dev/null & ) || true
+    local logd="$HOME/.config/opencode-telegram-bot/logs" blog n off i
+    blog="$logd/bot-manual.log"; mkdir -p "$logd"
+    for n in 1 2 3; do
+        pkill -TERM -f 'opencode-telegram start' 2>/dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            pgrep -f 'opencode-telegram start' >/dev/null 2>&1 || break
+            sleep 1
+        done
+        pkill -KILL -f 'opencode-telegram start' 2>/dev/null || true
+        sleep 5     # để Telegram nhả kết nối getUpdates cũ (tránh 409 Conflict → bot điếc)
+        off="$(stat -c %s "$blog" 2>/dev/null || echo 0)"
+        ( cd "$HOME" && setsid nohup opencode-telegram start >>"$blog" 2>&1 </dev/null & ) || true
+        sleep 25
+        if tail -c +$(( off + 1 )) "$blog" 2>/dev/null | grep -qE 'startup failed|409'; then
+            echo "[$(date '+%H:%M:%S')] bot gặp 409 (hai bản cùng chạy) — thử lại ($n/3)"
+            log "guard: bot 409, retry $n" guard
+            sleep 35
+            continue
+        fi
+        break
+    done
     echo "[$(date '+%H:%M:%S')] đã restart bot Telegram"
     log "guard: bot restarted" guard
     return 0
