@@ -1407,6 +1407,7 @@ guard_restart_bot() {
     [ "${BOT_RESTART:-1}" = "1" ] || return 0
     if systemctl --user is-enabled opencode-telegram-bot >/dev/null 2>&1; then
         systemctl --user restart opencode-telegram-bot 2>/dev/null || true
+        sleep 14      # ExecStartPre 5s + bot kết nối lại server & gắn vào session
         echo "[$(date '+%H:%M:%S')] đã restart bot Telegram (systemd)"
         log "guard: bot restarted via systemd" guard
         return 0
@@ -1508,8 +1509,9 @@ guard_main() {
             rm -f "$STATE_DIR/rotating.flag"
             token_reset quiet
             [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] && guard_start_service
+            guard_restart_bot          # bot gắn lại TRƯỚC khi gửi continue → thấy continue và câu trả lời
             for s in $sids; do guard_resume_sid "$s"; done
-            last_act="$(date +%s)"; bot_pending=1
+            last_act="$(date +%s)"
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
             continue
         fi
@@ -1525,6 +1527,7 @@ guard_main() {
                 warp_heal || true
             fi
             [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] && guard_start_service
+            guard_restart_bot
             for s in $sids; do guard_resume_sid "$s"; done
             off="$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)"
         else
