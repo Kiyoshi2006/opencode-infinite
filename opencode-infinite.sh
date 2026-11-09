@@ -1515,6 +1515,15 @@ guard_main() {
             touch "$STATE_DIR/rotating.flag"
             rotate "guard-hermes" || true
             rm -f "$STATE_DIR/rotating.flag"
+            # Hermes chạy trong tmux (mặc định phiên tên "hermes") → gõ /retry vào đúng cửa sổ đó
+            if command -v tmux >/dev/null 2>&1 && tmux has-session -t "${HERMES_TMUX:-hermes}" 2>/dev/null; then
+                sleep 2
+                tmux send-keys -t "${HERMES_TMUX:-hermes}" C-u "/retry" Enter 2>/dev/null \
+                    && echo "[$(date '+%H:%M:%S')] đã gõ /retry vào tmux '${HERMES_TMUX:-hermes}'"
+            else
+                echo "[$(date '+%H:%M:%S')] không thấy tmux '${HERMES_TMUX:-hermes}' — tự gõ /retry trong Hermes"
+            fi
+            sleep 3
             hermes_scan >/dev/null
             continue
         fi

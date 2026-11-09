@@ -263,3 +263,11 @@ journalctl --user -u opencode-guard -f     # xem log
 
 Người gác canh log của server OpenCode dùng chung (Telegram bot + TUI). Session nào dính limit thì xoay IP WARP, xoá token, dựng lại server qua proxy WARP, rồi gửi `continue` vào đúng session đó (`--session <id>`).
 Khi guard chạy, menu SSH không tự xoay nữa; mở OpenCode xong chọn session bằng `/sessions`.
+
+### Hermes trong SSH (tự /retry)
+Chạy Hermes trong tmux có proxy WARP, guard sẽ xoay IP rồi tự gõ `/retry` vào đúng cửa sổ đó:
+```
+sudo apt install -y tmux
+tmux new -s hermes 'HTTPS_PROXY=http://127.0.0.1:40000 HTTP_PROXY=http://127.0.0.1:40000 NO_PROXY=localhost,127.0.0.1,::1 hermes'
+```
+Thoát tmux mà không tắt: Ctrl+B rồi D. Vào lại: `tmux attach -t hermes`. Đổi tên phiên: `HERMES_TMUX=ten`.
