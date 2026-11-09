@@ -1008,6 +1008,23 @@ scan_log() {
 # ---------------------------------------------------------------
 # ROTATE EGRESS
 # ---------------------------------------------------------------
+# Thử Zen bằng 1 yêu cầu siêu nhẹ qua proxy WARP: 0 = còn quota, 1 = IP bị limit (đánh dấu dải), 2 = chưa rõ (mạng lỗi)
+ZEN_PROBE="${ZEN_PROBE:-1}"
+zen_probe() {
+    [ "$ZEN_PROBE" = "1" ] || return 0
+    [ -n "${ACTIVE_PROXY:-}" ] || return 0
+    local r
+    r="$(curl -s -m 15 --proxy "$ACTIVE_PROXY" https://opencode.ai/zen/v1/chat/completions \
+        -H "Authorization: Bearer public" -H "Content-Type: application/json" \
+        -H "User-Agent: opencode/latest/2.2.6/cli" -H "x-opencode-client: cli" \
+        -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' 2>/dev/null || true)"
+    if echo "$r" | grep -q 'FreeUsageLimitError'; then
+        burn_mark "$IP"; log "zen_probe LIMIT ip=$IP" probe; return 1
+    fi
+    if echo "$r" | grep -q '"choices"'; then log "zen_probe OK ip=$IP" probe; return 0; fi
+    log "zen_probe unknown ip=$IP r=${r:0:80}" probe; return 2
+}
+
 rotate() {
     local attempt="${1:-1}"
     echo ""
@@ -1028,10 +1045,10 @@ rotate() {
         wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
         local reroll=0
-        while { [ -z "$IP" ] || burn_is "$IP"; } && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
+        while { [ -z "$IP" ] || burn_is "$IP" || ! zen_probe; } && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
             reroll=$(( reroll + 1 ))
             if [ -z "$IP" ]; then echo "    WARP chưa ra mạng (IP trống) — đổi tiếp (lần $reroll)..."; sleep 3
-            else echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."; fi
+            else echo "    IP ${IP} đã bị limit (dải đã đánh dấu hoặc Zen báo hết quota) — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."; fi
             prev_ip="$IP"
             warp_rotate
             sleep "$ROTATE_COOLDOWN"
