@@ -1457,6 +1457,25 @@ guard_resume_sid() {
     sleep 2
 }
 
+
+# Hermes (không qua server OpenCode) báo FreeUsageLimitError trong log của nó → chỉ cần xoay IP (Hermes gọi ra qua proxy WARP)
+declare -A HOFF
+hermes_scan() {
+    local f sz off out=""
+    HERMES_HIT=""
+    for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log" "$HOME/.hermes/logs/gateway.log"; do
+        [ -f "$f" ] || continue
+        sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"; off="${HOFF[$f]:-}"
+        if [ -z "$off" ]; then HOFF[$f]="$sz"; continue; fi
+        [ "$sz" -lt "$off" ] && off=0
+        if [ "$sz" -gt "$off" ]; then
+            out+="$(tail -c +$(( off + 1 )) "$f" 2>/dev/null | head -c 2000000 | grep -iE 'FreeUsageLimitError|Free usage limit reached' || true)"
+            HOFF[$f]="$sz"
+        fi
+    done
+    HERMES_HIT="$out"
+}
+
 guard_main() {
     mkdir -p "$STATE_DIR"
     trap 'rm -f "$GUARD_PID_FILE"; health_stop; exit 0' TERM INT
@@ -1486,6 +1505,18 @@ guard_main() {
         sleep "$GUARD_POLL"
         if [ "$bot_pending" = "1" ] && [ $(( $(date +%s) - last_act )) -ge 45 ]; then
             guard_restart_bot; bot_pending=0
+        fi
+        # Nguồn 3: log của Hermes
+        hermes_scan
+        if [ -n "$HERMES_HIT" ]; then
+            echo "[$(date '+%H:%M:%S')] HERMES báo limit — xoay IP"
+            guard_kill_resumes
+            burn_mark "$IP"
+            touch "$STATE_DIR/rotating.flag"
+            rotate "guard-hermes" || true
+            rm -f "$STATE_DIR/rotating.flag"
+            hermes_scan >/dev/null
+            continue
         fi
         # Nguồn 2: log của bot Telegram báo "Session error: ses_xxx: Free usage limit" NGAY LÚC lỗi xảy ra
         # (log server đôi khi ghi trễ cả phút) → phát hiện sớm + biết đúng session.
