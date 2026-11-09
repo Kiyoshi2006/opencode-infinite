@@ -323,7 +323,13 @@ warp_up() {
         fi
     fi
 
-    # Verify proxy port listening
+    # Verify proxy port listening (vừa connect/rotate có thể cần vài giây; thiếu thì ép proxy mode lại)
+    local _w
+    for _w in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null && break
+        [ "$_w" = "5" ] && { warp_cmd mode proxy; warp_cmd proxy port "$PROXY_PORT"; warp_cmd connect; }
+        sleep 2
+    done
     if ! nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null; then
         echo -e "${C_WARN}  [!] WARP proxy port $PROXY_PORT không listen — falling back NONE.${C_RST}"
         ACTIVE_PROXY=""; log "warp proxy port not listening" warp; return 1
@@ -1017,6 +1023,8 @@ rotate() {
         local prev_ip="${IP:-}" same=0
         warp_rotate
         sleep "$ROTATE_COOLDOWN"
+        warp_up >/dev/null 2>&1 || true
+        [ -z "$ACTIVE_PROXY" ] && { echo "    [!] WARP proxy chưa lên — thử lại"; return 1; }
         wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
         local reroll=0
@@ -1027,6 +1035,8 @@ rotate() {
             prev_ip="$IP"
             warp_rotate
             sleep "$ROTATE_COOLDOWN"
+            warp_up >/dev/null 2>&1 || true
+            [ -z "$ACTIVE_PROXY" ] && { echo "    [!] WARP proxy chưa lên — thử lại"; return 1; }
             wait_warp_ready "$ACTIVE_PROXY" || true
             get_ip "$ACTIVE_PROXY"
             if [ -n "$IP" ] && [ "$IP" = "$prev_ip" ]; then
@@ -1492,6 +1502,10 @@ guard_main() {
     [ -z "$WARP_BIN" ] && { echo "guard: chưa cài WARP" >&2; exit 1; }
     warp_check_tunnel_danger || exit 1
     egress_connect || exit 1
+    if [ -z "$ACTIVE_PROXY" ]; then
+        echo "[guard] WARP proxy chưa lên — thoát để systemd chạy lại (KHÔNG dùng IP trực tiếp)" >&2
+        exit 1
+    fi
     WARP_UP=1
     echo "[guard] chạy. IP=$IP proxy=$ACTIVE_PROXY log=$LOGFILE"
     log "guard start ip=$IP" guard
@@ -1514,7 +1528,7 @@ guard_main() {
             guard_kill_resumes
             burn_mark "$IP"
             touch "$STATE_DIR/rotating.flag"
-            rotate "guard-hermes" || true
+            until rotate "guard-hermes"; do sleep 5; done
             rm -f "$STATE_DIR/rotating.flag"
             # Hermes chạy trong tmux (mặc định phiên tên "hermes") → gõ /retry vào đúng cửa sổ đó
             if command -v tmux >/dev/null 2>&1 && tmux has-session -t "${HERMES_TMUX:-hermes}" 2>/dev/null; then
