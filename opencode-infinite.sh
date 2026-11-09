@@ -1020,9 +1020,10 @@ rotate() {
         wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
         local reroll=0
-        while burn_is "$IP" && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
+        while { [ -z "$IP" ] || burn_is "$IP"; } && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
             reroll=$(( reroll + 1 ))
-            echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."
+            if [ -z "$IP" ]; then echo "    WARP chưa ra mạng (IP trống) — đổi tiếp (lần $reroll)..."; sleep 3
+            else echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."; fi
             prev_ip="$IP"
             warp_rotate
             sleep "$ROTATE_COOLDOWN"
@@ -1518,7 +1519,7 @@ guard_main() {
             # Hermes chạy trong tmux (mặc định phiên tên "hermes") → gõ /retry vào đúng cửa sổ đó
             if command -v tmux >/dev/null 2>&1 && tmux has-session -t "${HERMES_TMUX:-hermes}" 2>/dev/null; then
                 sleep 2
-                tmux send-keys -t "${HERMES_TMUX:-hermes}" C-u "/retry" Enter 2>/dev/null \
+                { tmux send-keys -t "${HERMES_TMUX:-hermes}" C-u 2>/dev/null; tmux send-keys -t "${HERMES_TMUX:-hermes}" -l "/retry" 2>/dev/null; sleep 1; tmux send-keys -t "${HERMES_TMUX:-hermes}" C-m 2>/dev/null; } \
                     && echo "[$(date '+%H:%M:%S')] đã gõ /retry vào tmux '${HERMES_TMUX:-hermes}'"
             else
                 echo "[$(date '+%H:%M:%S')] không thấy tmux '${HERMES_TMUX:-hermes}' — tự gõ /retry trong Hermes"
