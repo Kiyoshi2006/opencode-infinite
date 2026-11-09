@@ -1487,6 +1487,29 @@ hermes_scan() {
     HERMES_HIT="$out"
 }
 
+# Gõ /retry vào cửa sổ tmux của Hermes và KIỂM TRA nó đã gửi thật (màn hình phải đổi sau Enter).
+# Menu gợi ý lệnh "/" có thể nuốt Enter đầu → thử lại bằng phím khác; ghi màn hình ra file để chẩn đoán.
+hermes_send_retry() {
+    local T="${HERMES_TMUX:-hermes}" before after k i ok=0
+    if ! command -v tmux >/dev/null 2>&1 || ! tmux has-session -t "$T" 2>/dev/null; then
+        echo "[$(date '+%H:%M:%S')] không thấy tmux '$T' — tự gõ /retry trong Hermes"; return 0
+    fi
+    sleep 2
+    tmux send-keys -t "$T" Escape 2>/dev/null; sleep 0.3
+    tmux send-keys -t "$T" C-u 2>/dev/null; sleep 0.3
+    tmux send-keys -t "$T" -l "/retry" 2>/dev/null; sleep 1.5
+    for i in 1 2 3 4; do
+        before="$(tmux capture-pane -p -t "$T" 2>/dev/null)"
+        case "$i" in 1|3) k=C-m;; 2) k=Enter;; 4) k=C-m;; esac
+        tmux send-keys -t "$T" "$k" 2>/dev/null; sleep 2.5
+        after="$(tmux capture-pane -p -t "$T" 2>/dev/null)"
+        if [ "$before" != "$after" ]; then ok=1; break; fi
+    done
+    tmux capture-pane -p -t "$T" 2>/dev/null | tail -25 > "$STATE_DIR/hermes-pane.txt"
+    if [ "$ok" = "1" ]; then echo "[$(date '+%H:%M:%S')] đã gõ /retry vào tmux '$T' (Enter lần $i, màn hình đã đổi)"
+    else echo "[$(date '+%H:%M:%S')] /retry KHÔNG có phản ứng sau 4 lần Enter — xem $STATE_DIR/hermes-pane.txt"; fi
+}
+
 guard_main() {
     mkdir -p "$STATE_DIR"
     trap 'rm -f "$GUARD_PID_FILE"; health_stop; exit 0' TERM INT
@@ -1531,13 +1554,7 @@ guard_main() {
             until rotate "guard-hermes"; do sleep 5; done
             rm -f "$STATE_DIR/rotating.flag"
             # Hermes chạy trong tmux (mặc định phiên tên "hermes") → gõ /retry vào đúng cửa sổ đó
-            if command -v tmux >/dev/null 2>&1 && tmux has-session -t "${HERMES_TMUX:-hermes}" 2>/dev/null; then
-                sleep 2
-                { tmux send-keys -t "${HERMES_TMUX:-hermes}" C-u 2>/dev/null; tmux send-keys -t "${HERMES_TMUX:-hermes}" -l "/retry" 2>/dev/null; sleep 1; tmux send-keys -t "${HERMES_TMUX:-hermes}" C-m 2>/dev/null; } \
-                    && echo "[$(date '+%H:%M:%S')] đã gõ /retry vào tmux '${HERMES_TMUX:-hermes}'"
-            else
-                echo "[$(date '+%H:%M:%S')] không thấy tmux '${HERMES_TMUX:-hermes}' — tự gõ /retry trong Hermes"
-            fi
+            hermes_send_retry
             sleep 3
             hermes_scan >/dev/null
             continue
