@@ -239,7 +239,7 @@ warp_check_tunnel_danger() {
     [ -z "$WARP_BIN" ] && return 0
     local status settings
     status="$("$WARP_BIN" status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
-    if echo "$status" | grep -qi 'Connected'; then
+    if echo "$status" | grep -qiE '(^|[^a-z])connected'; then
         settings="$("$WARP_BIN" settings 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
         if echo "$settings" | grep -qi 'Tunnel' && ! echo "$settings" | grep -qi 'proxy'; then
             echo ""
@@ -304,7 +304,7 @@ warp_up() {
     local status
     status="$("$WARP_BIN" status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\r//' || echo "")"
 
-    if echo "$status" | grep -qi 'Connected'; then
+    if echo "$status" | grep -qiE '(^|[^a-z])connected'; then
         # Đã connected (proxy mode đã verify bởi warp_check_tunnel_danger)
         echo "    WARP đã connected."
     else
