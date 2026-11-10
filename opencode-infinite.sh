@@ -366,12 +366,17 @@ warp_up() {
 wait_warp_ready() {
     local proxy="${1:-}" i t
     [ -z "$proxy" ] && return 0
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        t="$(curl -s --max-time 6 --proxy "$proxy" "$TRACE_URL" 2>/dev/null || true)"
+    for i in $(seq 1 25); do
+        t="$(curl -s --max-time 3 --proxy "$proxy" "$TRACE_URL" 2>/dev/null || true)"
         if echo "$t" | grep -qE '^warp=(on|plus)'; then return 0; fi
-        sleep 2
+        # sau ~12s chưa lên: nối lại WARP một lần (proxy mode, không đụng tunnel)
+        if [ "$i" -eq 12 ] && [ -n "${WARP_BIN:-}" ]; then
+            "$WARP_BIN" mode proxy >/dev/null 2>&1 || true
+            "$WARP_BIN" --accept-tos connect >/dev/null 2>&1 || true
+        fi
+        sleep 1
     done
-    echo -e "${C_WARN}  [!] Tunnel WARP chưa ổn định sau 20s — vẫn tiếp tục.${C_RST}"
+    echo -e "${C_WARN}  [!] Tunnel WARP chưa ổn định sau ~25s — vẫn tiếp tục.${C_RST}"
     return 1
 }
 
@@ -1026,8 +1031,22 @@ rotate() {
         [ "${FAST_ROTATE:-1}" = "1" ] || sleep "$ROTATE_COOLDOWN"
         wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
-        local reroll=0
-        while burn_is "$IP" && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
+        local reroll=0 empty=0
+        # lặp khi IP rỗng (proxy chưa lên, tối đa 3 lần liền) HOẶC IP thuộc dải đã bị limit
+        while { [ -z "${IP:-}" ] && [ "$empty" -lt 3 ]; } || { burn_is "${IP:-}" && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; }; do
+            if [ -z "${IP:-}" ]; then
+                empty=$(( empty + 1 ))
+                echo "    chưa lấy được IP (proxy WARP chưa lên) — thử lại (lần $empty/3)..."
+                if [ "$empty" -lt 3 ]; then
+                    warp_cmd mode proxy; warp_cmd proxy port 40000; warp_cmd connect   # nối lại, chưa cần đăng ký mới
+                else
+                    warp_rotate
+                fi
+                wait_warp_ready "$ACTIVE_PROXY" || true
+                get_ip "$ACTIVE_PROXY"
+                continue
+            fi
+            empty=0
             reroll=$(( reroll + 1 ))
             echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."
             prev_ip="$IP"
