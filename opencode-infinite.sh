@@ -1489,9 +1489,14 @@ guard_resume_sid() {
 # Hermes (không qua server OpenCode) báo FreeUsageLimitError trong log của nó → chỉ cần xoay IP (Hermes gọi ra qua proxy WARP)
 declare -A HOFF
 hermes_plugin_patched() {
+    # Hermes có đi qua WARP không? Đúng nếu: (a) plugin trỏ về cầu nối cục bộ (Bun đi qua proxy WARP), hoặc
+    # (b) plugin đã vá ProxyHandler 40000, hoặc (c) ép bằng HERMES_WATCH_FORCE=1.
+    [ "${HERMES_WATCH_FORCE:-0}" = "1" ] && return 0
     local f
     f="$(find "$HOME/.hermes/plugins" -name hermes_oc_client.py 2>/dev/null | head -1)"
-    [ -n "$f" ] && grep -q "OC_PROXY_PATCH" "$f" && grep -qE '^_OC_PX = .*127\.0\.0\.1:40000' "$f"
+    [ -n "$f" ] || return 1
+    grep -qE '^DIRECT_URL *= *"?https?://127\.0\.0\.1:[0-9]+' "$f" && return 0
+    grep -q "OC_PROXY_PATCH" "$f" && grep -qE '^_OC_PX = .*127\.0\.0\.1:40000' "$f"
 }
 
 hermes_scan() {
@@ -1800,6 +1805,42 @@ folder_menu() {
 # ---------------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------------
+# --hermes-check: chỉ in những gì guard sẽ thấy ở log Hermes (KHÔNG xoay, KHÔNG sửa gì)
+hermes_check() {
+    local f n=0 hits
+    echo "== 1. Hermes có được guard canh không (đường ra qua WARP)?"
+    if hermes_plugin_patched; then echo "   CÓ (plugin trỏ cầu nối cục bộ / đã vá proxy / HERMES_WATCH_FORCE=1)"
+    else echo "   KHÔNG — guard sẽ bỏ qua Hermes (đặt HERMES_WATCH_FORCE=1 nếu vẫn muốn canh)"; fi
+    echo "== 2. Cầu nối cục bộ"
+    ss -ltn 2>/dev/null | grep -E ':(8788|8787) ' | awk '{print "   LISTEN " $4}' || true
+    [ -z "$(ss -ltn 2>/dev/null | grep -E ':(8788|8787) ')" ] && echo "   không thấy cổng 8788/8787"
+    echo "== 3. Dòng limit gần nhất trong log Hermes (mẫu guard dùng: FreeUsageLimitError|Free usage limit reached)"
+    for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log" "$HOME/.hermes/logs/gateway.log"; do
+        [ -f "$f" ] || { echo "   (không có $f)"; continue; }
+        hits="$(grep -iE 'FreeUsageLimitError|Free usage limit reached' "$f" 2>/dev/null | tail -2)"
+        n=$(grep -ciE 'FreeUsageLimitError|Free usage limit reached' "$f" 2>/dev/null || echo 0)
+        echo "   $(basename "$f"): $n dòng khớp"
+        [ -n "$hits" ] && echo "$hits" | cut -c1-170 | sed 's/^/      /'
+    done
+    echo "== 4. Tuổi dòng khớp mới nhất (guard chỉ phản ứng với dòng MỚI xuất hiện sau khi nó chạy)"
+    for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log"; do
+        [ -f "$f" ] && echo "   $(basename "$f") sửa lần cuối: $(date -r "$f" '+%F %T')"
+    done
+}
+
+# --rotate-once: xoay WARP đúng 1 lần rồi in IP trước/sau (để thử riêng khâu xoay)
+rotate_once() {
+    EGRESS=WARP; find_warp
+    [ -z "$WARP_BIN" ] && { echo "chưa cài WARP" >&2; return 1; }
+    warp_check_tunnel_danger || return 1
+    egress_connect || return 1
+    [ -n "${ACTIVE_PROXY:-}" ] || { echo "WARP proxy chưa lên" >&2; return 1; }
+    echo "IP trước: ${IP:-unknown}"
+    local i
+    for i in 1 2 3 4 5; do rotate "once" && break; sleep 3; done
+    echo "IP sau:   ${IP:-unknown}"
+}
+
 main() {
     mkdir -p "$STATE_DIR"
     trim_log "$LAUNCHER_LOG" "$LOG_MAX_KB"
@@ -1809,6 +1850,8 @@ main() {
         --guard-install)   guard_install; return ;;
         --guard-uninstall) guard_uninstall; return ;;
         --bot-install)     bot_install; return ;;
+        --hermes-check)    hermes_check; return ;;
+        --rotate-once)     rotate_once; return ;;
     esac
     lock_check
 
