@@ -8,6 +8,12 @@ const rnd = (n) => Array.from({ length: n }, () => "0123456789abcdefghijklmnopqr
 const SES = process.env.OC_SESSION || "ses_" + Array.from({ length: 12 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("") + rnd(14);
 const PROJECT = process.env.OC_PROJECT || "1751ba12936fd079fff18cea3db58f28811c2004";
 
+const PASS = process.env.RELAY_PASSTHROUGH === "1";
+const LOG = process.env.RELAY_LOG;
+const fs = require("node:fs");
+const logw = (t) => { if (LOG) try { fs.appendFileSync(LOG, t + "\n"); } catch {} };
+const DROP = new Set(["host", "content-length", "connection", "accept-encoding", "transfer-encoding"]);
+
 const server = http.createServer(async (req, res) => {
   try {
     const chunks = [];
@@ -22,9 +28,11 @@ const server = http.createServer(async (req, res) => {
       try { const j = JSON.parse(body); if (typeof j.model === "string") j.model = j.model.replace(/^opencode(-free)?\//, ""); body = Buffer.from(JSON.stringify(j)); } catch {}
     }
     const path = req.url.replace(/^\/v1/, "/zen/v1");
+    const fwd = PASS ? Object.fromEntries(Object.entries(req.headers).filter(([k]) => !DROP.has(k))) : null;
+    logw(`=== ${new Date().toISOString()} ${req.method} ${req.url} pass=${PASS}\n  HEADERS ${JSON.stringify(req.headers)}\n  BODY ${body.toString("utf8")}`);
     const r = await fetch(UP + path, {
       method: req.method,
-      headers: {
+      headers: PASS ? fwd : {
         "Content-Type": "application/json",
         Authorization: "Bearer public",
         "User-Agent": `opencode/latest/${VER}/cli`,
@@ -37,6 +45,7 @@ const server = http.createServer(async (req, res) => {
       },
       body: body.length ? body : undefined,
     });
+    logw(`  -> upstream ${r.status}`);
     const h = { "content-type": r.headers.get("content-type") || "application/json" };
     res.writeHead(r.status, h);
     if (!r.body) return res.end();
