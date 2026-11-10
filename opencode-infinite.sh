@@ -1495,13 +1495,13 @@ hermes_send_retry() {
 hermes_scan() {
     local f sz off out=""
     HERMES_HIT=""
-    for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log" "$HOME/.hermes/logs/gateway.log"; do
+    for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log" "$HOME/.hermes/logs/gateway.log" "${ZEN_BRIDGE_LOG:-/tmp/opencode/zen-bridge.log}"; do
         [ -f "$f" ] || continue
         sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"; off="${HOFF[$f]:-}"
         if [ -z "$off" ]; then HOFF[$f]="$sz"; continue; fi
         [ "$sz" -lt "$off" ] && off=0
         if [ "$sz" -gt "$off" ]; then
-            out+="$(tail -c +$(( off + 1 )) "$f" 2>/dev/null | head -c 2000000 | grep -iE 'FreeUsageLimitError|Free usage limit reached' || true)"
+            out+="$(tail -c +$(( off + 1 )) "$f" 2>/dev/null | head -c 2000000 | grep -iE 'FreeUsageLimitError|Free usage limit reached|429 với ses_[A-Za-z0-9]+, thử session khác \(10/10\)' || true)"
             HOFF[$f]="$sz"
         fi
     done
