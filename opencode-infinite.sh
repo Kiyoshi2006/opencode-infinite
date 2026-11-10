@@ -1493,15 +1493,17 @@ hermes_send_retry() {
 }
 
 hermes_scan() {
-    local f sz off out=""
-    HERMES_HIT=""
-    for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log" "$HOME/.hermes/logs/gateway.log" "${ZEN_BRIDGE_LOG:-/tmp/opencode/zen-bridge.log}"; do
+    local f sz off out="" got
+    HERMES_HIT=""; HERMES_HIT_SRC=""
+    for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log" "$HOME/.hermes/logs/gateway.log"; do
         [ -f "$f" ] || continue
         sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"; off="${HOFF[$f]:-}"
         if [ -z "$off" ]; then HOFF[$f]="$sz"; continue; fi
         [ "$sz" -lt "$off" ] && off=0
         if [ "$sz" -gt "$off" ]; then
-            out+="$(tail -c +$(( off + 1 )) "$f" 2>/dev/null | head -c 2000000 | grep -iE 'FreeUsageLimitError|Free usage limit reached|429 với ses_[A-Za-z0-9]+, thử session khác \(10/10\)' || true)"
+            got="$(tail -c +$(( off + 1 )) "$f" 2>/dev/null | head -c 2000000 | grep -iE 'FreeUsageLimitError|Free usage limit reached' || true)"
+            [ -n "$got" ] && HERMES_HIT_SRC+="$f "
+            out+="$got"
             HOFF[$f]="$sz"
         fi
     done
@@ -1806,6 +1808,37 @@ rotate_once() {
     echo "IP sau:   ${IP:-unknown}"
 }
 
+# ---- test từng bước cho Hermes (chỉ đọc, trừ --hermes-test-send) ----
+hermes_test_read() {
+    local secs="${1:-600}" t0 n=0
+    t0=$(date +%s)
+    hermes_scan >/dev/null     # đặt mốc đọc = cuối file hiện tại
+    echo "Đã đặt mốc. Giờ hãy làm Hermes bị limit (trong ${secs}s). Ctrl+C để dừng."
+    while [ $(( $(date +%s) - t0 )) -lt "$secs" ]; do
+        hermes_scan
+        if [ -n "$HERMES_HIT" ]; then
+            n=$(( n + 1 ))
+            echo "[$(date '+%H:%M:%S')] ĐỌC ĐƯỢC limit #$n từ: $HERMES_HIT_SRC"
+            echo "$HERMES_HIT" | tail -n 2 | cut -c1-200
+        fi
+        sleep 2
+    done
+    [ "$n" -eq 0 ] && echo "KHÔNG thấy dòng limit nào trong log Hermes sau ${secs}s"
+    return 0
+}
+hermes_test_session() {
+    local T="${HERMES_TMUX:-hermes}"
+    command -v tmux >/dev/null 2>&1 || { echo "không có tmux"; return 0; }
+    echo "== tmux sessions"; tmux list-sessions 2>&1
+    tmux has-session -t "$T" 2>/dev/null || { echo "KHÔNG có session '$T' → /retry sẽ không gửi"; return 0; }
+    echo "== pane của '$T'"
+    tmux list-panes -t "$T" -F 'pane=#{pane_id} pid=#{pane_pid} lệnh=#{pane_current_command} kích_thước=#{pane_width}x#{pane_height}'
+    echo "== tiến trình con của pane (phải thấy hermes, KHÔNG phải opencode)"
+    pstree -ap "$(tmux display -p -t "$T" '#{pane_pid}')" 2>/dev/null | cut -c1-140 | head -8
+    echo "== 8 dòng cuối màn hình pane"
+    tmux capture-pane -p -t "$T" | grep -v '^$' | tail -8 | cut -c1-140
+}
+
 main() {
     mkdir -p "$STATE_DIR"
     trim_log "$LAUNCHER_LOG" "$LOG_MAX_KB"
@@ -1817,6 +1850,9 @@ main() {
         --bot-install)     bot_install; return ;;
         --hermes-check)    hermes_check; return ;;
         --rotate-once)     rotate_once; return ;;
+        --hermes-test-read)    hermes_test_read "${2:-600}"; return ;;
+        --hermes-test-session) hermes_test_session; return ;;
+        --hermes-test-send)    mkdir -p "$STATE_DIR"; hermes_send_retry; return ;;
     esac
     lock_check
 
