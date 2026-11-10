@@ -294,6 +294,11 @@ warp_up() {
             echo -e "${C_ERR}  [!] WARP registration thất bại.${C_RST}"
             log "warp reg failed" warp; return 1
         fi
+        # account mới được warp-cli tự connect ở chế độ MẶC ĐỊNH (tunnel → có thể cắt SSH).
+        # Đặt proxy mode NGAY, trước mọi bước khác.
+        warp_cmd mode proxy
+        warp_cmd proxy port "$PROXY_PORT"
+        sleep 1
     fi
 
     local status
