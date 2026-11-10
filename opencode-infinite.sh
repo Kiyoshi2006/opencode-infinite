@@ -404,9 +404,11 @@ burn_is() {
 
 warp_rotate() {
     log "warp_rotate: start" warp
-    warp_cmd disconnect
+    local _t0; _t0=$(date +%s)
+    # FAST_ROTATE=1 (mặc định): như bản gốc của tác giả — không disconnect/sleep cố định, wait_warp_ready tự lặp. FAST_ROTATE=0: kiểu cũ.
+    if [ "${FAST_ROTATE:-1}" != "1" ]; then warp_cmd disconnect; fi
     warp_cmd registration delete
-    sleep 2
+    if [ "${FAST_ROTATE:-1}" != "1" ]; then sleep 2; fi
     warp_cmd --accept-tos registration new
     REG_FAIL=0
     if echo "${WARP_LAST:-}" | grep -qiE 'error|fail|too many|rate|limit|unable'; then
@@ -419,8 +421,8 @@ warp_rotate() {
     warp_cmd mode proxy
     warp_cmd proxy port 40000
     warp_cmd connect
-    sleep "$WARP_WAIT"
-    log "warp rotated" warp
+    if [ "${FAST_ROTATE:-1}" != "1" ]; then sleep "$WARP_WAIT"; fi
+    log "warp rotated in $(( $(date +%s) - _t0 ))s" warp
 }
 
 # ---------------------------------------------------------------
@@ -1016,7 +1018,7 @@ rotate() {
         fi
         local prev_ip="${IP:-}" same=0
         warp_rotate
-        sleep "$ROTATE_COOLDOWN"
+        [ "${FAST_ROTATE:-1}" = "1" ] || sleep "$ROTATE_COOLDOWN"
         wait_warp_ready "$ACTIVE_PROXY" || true
         get_ip "$ACTIVE_PROXY"
         local reroll=0
@@ -1025,7 +1027,7 @@ rotate() {
             echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."
             prev_ip="$IP"
             warp_rotate
-            sleep "$ROTATE_COOLDOWN"
+            [ "${FAST_ROTATE:-1}" = "1" ] || sleep "$ROTATE_COOLDOWN"
             wait_warp_ready "$ACTIVE_PROXY" || true
             get_ip "$ACTIVE_PROXY"
             if [ -n "$IP" ] && [ "$IP" = "$prev_ip" ]; then
