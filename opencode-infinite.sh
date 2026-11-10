@@ -1009,7 +1009,7 @@ scan_log() {
 # ROTATE EGRESS
 # ---------------------------------------------------------------
 # Thử Zen bằng 1 yêu cầu siêu nhẹ qua proxy WARP: 0 = còn quota, 1 = IP bị limit (đánh dấu dải), 2 = chưa rõ (mạng lỗi)
-ZEN_PROBE="${ZEN_PROBE:-1}"
+ZEN_PROBE="${ZEN_PROBE:-0}"   # 1 = thử Zen sau mỗi lần xoay (mặc định TẮT: một lần thử đơn lẻ có thể báo limit nhầm, làm cháy IP tốt)
 zen_probe() {
     [ "$ZEN_PROBE" = "1" ] || return 0
     [ -n "${ACTIVE_PROXY:-}" ] || return 0
@@ -1488,6 +1488,12 @@ guard_resume_sid() {
 
 # Hermes (không qua server OpenCode) báo FreeUsageLimitError trong log của nó → chỉ cần xoay IP (Hermes gọi ra qua proxy WARP)
 declare -A HOFF
+hermes_plugin_patched() {
+    local f
+    f="$(find "$HOME/.hermes/plugins" -name hermes_oc_client.py 2>/dev/null | head -1)"
+    [ -n "$f" ] && grep -q "OC_PROXY_PATCH" "$f" && grep -qE '^_OC_PX = .*127\.0\.0\.1:40000' "$f"
+}
+
 hermes_scan() {
     local f sz off out=""
     HERMES_HIT=""
@@ -1561,8 +1567,10 @@ guard_main() {
         if [ "$bot_pending" = "1" ] && [ $(( $(date +%s) - last_act )) -ge 45 ]; then
             guard_restart_bot; bot_pending=0
         fi
-        # Nguồn 3: log của Hermes
-        hermes_scan
+        # Nguồn 3: log của Hermes — CHỈ khi plugin đã vá để đi qua WARP (nếu chưa, lỗi limit của nó là của IP thật
+        # của VPS, xoay WARP vô ích và còn đánh dấu cháy nhầm IP WARP tốt)
+        HERMES_HIT=""
+        if [ "${HERMES_WATCH:-1}" = "1" ] && hermes_plugin_patched; then hermes_scan; fi
         if [ -n "$HERMES_HIT" ]; then
             echo "[$(date '+%H:%M:%S')] HERMES báo limit — xoay IP"
             guard_kill_resumes

@@ -7,9 +7,14 @@ F="$(find "$HOME/.hermes" -name hermes_oc_client.py 2>/dev/null | head -1)"
 [ -z "$F" ] && { echo "Không tìm thấy hermes_oc_client.py trong ~/.hermes"; exit 1; }
 echo "File plugin: $F"
 if [ "${1:-}" = "--undo" ]; then
-  [ -f "$F.orig" ] && cp -f "$F.orig" "$F" && echo "Đã trả lại bản gốc." || echo "Không có bản sao lưu."; exit 0
+  [ -f "$F.orig" ] && cp -f "$F.orig" "$F" && echo "Đã trả lại bản gốc." || echo "Không có bản sao lưu."; pkill -f "hermes_cli.main.*gateway run" 2>/dev/null; exit 0
 fi
-if grep -q "OC_PROXY_PATCH" "$F"; then echo "Đã vá rồi."; exit 0; fi
+reload() { pkill -f "hermes_cli.main.*gateway run" 2>/dev/null; echo "Đã tắt tiến trình nền Hermes để nó nạp lại plugin."; }
+if grep -q "OC_PROXY_PATCH" "$F"; then
+  # đã vá: chỉ đảm bảo địa chỉ mặc định là proxy WARP (sửa trường hợp bị kẹt ở proxy thử nghiệm)
+  sed -i '/^_OC_PX = /s#127\.0\.0\.1:9"#127.0.0.1:40000"#' "$F"
+  grep -n "^_OC_PX = " "$F"; reload; exit 0
+fi
 [ -f "$F.orig" ] || cp -f "$F" "$F.orig"
 python3 - "$F" <<'PY'
 import re, sys
@@ -24,4 +29,4 @@ new = (r'\1# OC_PROXY_PATCH: ép đi qua proxy WARP (đặt OC_PROXY=off để t
 open(p, "w", encoding="utf8").write(pat.sub(new, s, count=1))
 PY
 rc=$?; [ $rc -ne 0 ] && exit $rc
-python3 -m py_compile "$F" && echo "Đã vá xong (kiểm tra cú pháp OK). Bản gốc: $F.orig"
+python3 -m py_compile "$F" && echo "Đã vá xong (kiểm tra cú pháp OK). Bản gốc: $F.orig" && reload
