@@ -448,10 +448,20 @@ warp_rotate() {
     if [ "${FAST_ROTATE:-1}" != "1" ]; then sleep 2; fi
     warp_cmd --accept-tos registration new
     REG_FAIL=0
-    if echo "${WARP_LAST:-}" | grep -qiE 'error|fail|too many|rate|limit|unable'; then
-        REG_FAIL=1
-        echo "    [warp] registration new báo lỗi: $(echo "$WARP_LAST" | head -c 160)"
-    fi
+    # đăng ký lỗi (API Cloudflare nghẽn) = WARP không còn tài khoản → chờ tunnel là vô ích. Thử đăng ký lại ngay,
+    # cách nhau 3,4,5…s (tối đa WARP_REG_RETRIES lần), chỉ khi vẫn lỗi mới đi tiếp như cũ.
+    local _try=0 _max="${WARP_REG_RETRIES:-6}"
+    while echo "${WARP_LAST:-}" | grep -qiE 'error|fail|too many|rate|limit|unable' || ! warp_is_registered; do
+        _try=$(( _try + 1 ))
+        log "warp registration retry $_try/$_max: ${WARP_LAST:-}" warp
+        if [ "$_try" -gt "$_max" ]; then
+            REG_FAIL=1; echo "    [warp] đăng ký vẫn lỗi sau $_max lần thử lại — bỏ qua"; break
+        fi
+        echo "    [warp] registration new báo lỗi: $(echo "${WARP_LAST:-}" | head -c 120) (thử lại $_try/$_max)"
+        sleep $(( _try + 2 ))
+        warp_cmd --accept-tos registration new
+    done
+    [ "$_try" -gt 0 ] && [ "$REG_FAIL" = 0 ] && echo "    [warp] đăng ký lại thành công sau $_try lần"
     log "warp rotate: registration done fail=$REG_FAIL" warp
     sleep "$ROTATE_COOLDOWN"
     # PHẢI set proxy mode trước khi connect (tránh tunnel mode → mất SSH)
