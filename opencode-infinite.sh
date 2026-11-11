@@ -1540,6 +1540,8 @@ hermes_scan() {
 # 0 = trả lời ok (IP dùng được), 1 = bị limit, 2 = lỗi khác (mạng/timeout). Không đụng bot Telegram.
 guard_probe() {
     local proxy="${ACTIVE_PROXY:-}" out sid model="${GUARD_PROBE_MODEL:-opencode/deepseek-v4.1-flash-free}"
+    # không có proxy = sẽ đi bằng IP thật của VPS (và đo sai IP) → coi là lỗi, không thử
+    if [ -z "$proxy" ] && [ "${EGRESS:-WARP}" != "NONE" ]; then echo "    probe: chưa có proxy — bỏ qua"; return 2; fi
     local pa=()
     [ -n "$proxy" ] && pa=(HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" http_proxy="$proxy" https_proxy="$proxy" NO_PROXY="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}" no_proxy="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}")
     out="$(cd "$HOME" && timeout -k 5 "${GUARD_PROBE_TIMEOUT:-45}" env "${pa[@]}" "$OC_CMD" run --standalone --format json -m "$model" "reply with the word ok" 2>&1 || true)"
@@ -1559,7 +1561,7 @@ guard_rotate_until_ok() {
     rotate "$why" || true
     [ "${GUARD_PROBE:-1}" = "1" ] || return 0
     while true; do
-        guard_probe; rc=$?
+        rc=0; guard_probe || rc=$?
         if [ "$rc" = 0 ]; then echo "    probe: IP ${IP:-?} trả lời ok"; return 0; fi
         n=$(( n + 1 ))
         if [ "$rc" = 1 ]; then
@@ -1923,7 +1925,7 @@ probe_once() {
     egress_connect || return 1
     echo "egress=$EGRESS proxy=${ACTIVE_PROXY:-không có} IP=${IP:-?}"
     local t0=$SECONDS rc
-    guard_probe; rc=$?
+    rc=0; guard_probe || rc=$?
     case $rc in
         0) echo "KẾT QUẢ: OK — IP trả lời 'ok' sau $(( SECONDS - t0 ))s" ;;
         1) echo "KẾT QUẢ: IP BỊ LIMIT ($(( SECONDS - t0 ))s)" ;;
