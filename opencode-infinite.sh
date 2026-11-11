@@ -1544,7 +1544,7 @@ guard_probe() {
     if [ -z "$proxy" ] && [ "${EGRESS:-WARP}" != "NONE" ]; then echo "    probe: chưa có proxy — bỏ qua"; return 2; fi
     local pa=()
     [ -n "$proxy" ] && pa=(HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" http_proxy="$proxy" https_proxy="$proxy" NO_PROXY="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}" no_proxy="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}")
-    out="$(cd "$HOME" && timeout -k 5 "${GUARD_PROBE_TIMEOUT:-45}" env "${pa[@]}" "$OC_CMD" run --standalone --format json -m "$model" "reply with the word ok" 2>&1 || true)"
+    out="$(cd "$HOME" && timeout -k 5 "${GUARD_PROBE_TIMEOUT:-25}" env "${pa[@]}" "$OC_CMD" run --standalone --format json -m "$model" "reply with the word ok" 2>&1 || true)"
     sid="$(printf '%s' "$out" | grep -o 'ses_[A-Za-z0-9]*' | head -n1)"
     [ -n "$sid" ] && "$OC_CMD" session delete "$sid" >/dev/null 2>&1 || true
     log "probe ip=${IP:-?} out=$(printf '%s' "$out" | tr '\n' ' ' | head -c 300)" guard
@@ -1557,7 +1557,7 @@ guard_probe() {
 # Xoay IP rồi thử nhẹ tới khi IP trả lời "ok" mới trả về (khi đó mới đáng khởi động lại bot + continue).
 # GUARD_PROBE=0 tắt; GUARD_PROBE_MAX=0 = thử vô hạn.
 guard_rotate_until_ok() {
-    local why="${1:-guard}" n=0 rc
+    local why="${1:-guard}" n=0 rc neterr=0
     rotate "$why" || true
     [ "${GUARD_PROBE:-1}" = "1" ] || return 0
     while true; do
@@ -1565,9 +1565,19 @@ guard_rotate_until_ok() {
         if [ "$rc" = 0 ]; then echo "    probe: IP ${IP:-?} trả lời ok"; return 0; fi
         n=$(( n + 1 ))
         if [ "$rc" = 1 ]; then
+            neterr=0
             echo "    probe: IP ${IP:-?} bị limit — xoay tiếp (lần $n)"; burn_mark "${IP:-}"
         else
-            echo "    probe: lỗi mạng/timeout (lần $n) — xoay tiếp"
+            # lỗi mạng ≠ IP limit: WARP đang kẹt. Xoay lúc này chỉ đăng ký thêm tài khoản (dễ bị Cloudflare giới hạn),
+            # nên nối lại WARP trước (không đăng ký mới); lỗi 3 lần liền mới xoay.
+            neterr=$(( neterr + 1 ))
+            if [ "$neterr" -le 2 ]; then
+                echo "    probe: lỗi mạng/timeout (lần $n) — nối lại WARP, chưa xoay"
+                warp_heal || true
+                continue
+            fi
+            neterr=0
+            echo "    probe: lỗi mạng liên tiếp (lần $n) — xoay"
         fi
         if [ "${GUARD_PROBE_MAX:-0}" -gt 0 ] && [ "$n" -ge "$GUARD_PROBE_MAX" ]; then
             echo "    probe: đã thử $n lần — dừng thử, gửi continue luôn"; return 0
