@@ -1914,6 +1914,23 @@ hermes_test_session() {
     tmux capture-pane -p -t "$T" | grep -v '^$' | tail -8 | cut -c1-140
 }
 
+probe_once() {
+    find_opencode; [ -z "$OC_CMD" ] && { echo "không tìm thấy opencode"; return 1; }
+    EGRESS="${GUARD_EGRESS:-WARP}"
+    if [ "$EGRESS" = WARP ]; then
+        find_warp; warp_check_tunnel_danger || return 1
+    fi
+    egress_connect || return 1
+    echo "egress=$EGRESS proxy=${ACTIVE_PROXY:-không có} IP=${IP:-?}"
+    local t0=$SECONDS rc
+    guard_probe; rc=$?
+    case $rc in
+        0) echo "KẾT QUẢ: OK — IP trả lời 'ok' sau $(( SECONDS - t0 ))s" ;;
+        1) echo "KẾT QUẢ: IP BỊ LIMIT ($(( SECONDS - t0 ))s)" ;;
+        *) echo "KẾT QUẢ: lỗi mạng/timeout ($(( SECONDS - t0 ))s) — xem log: $LAUNCHER_LOG" ;;
+    esac
+}
+
 main() {
     mkdir -p "$STATE_DIR"
     trim_log "$LAUNCHER_LOG" "$LOG_MAX_KB"
@@ -1925,6 +1942,7 @@ main() {
         --bot-install)     bot_install; return ;;
         --hermes-check)    hermes_check; return ;;
         --rotate-once)     rotate_once; return ;;
+        --probe-once)      probe_once; return ;;
         --hermes-test-read)    hermes_test_read "${2:-600}"; return ;;
         --hermes-test-session) hermes_test_session; return ;;
         --hermes-test-send)    mkdir -p "$STATE_DIR"; hermes_send_retry; return ;;
