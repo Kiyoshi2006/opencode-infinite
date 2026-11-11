@@ -366,19 +366,30 @@ warp_up() {
 # Chờ proxy thật sự ra Cloudflare (warp=on) trước khi mở OpenCode — tránh 502/ECONNRESET
 # khi tunnel vừa (re)connect còn "unstable".
 wait_warp_ready() {
-    local proxy="${1:-}" i t
+    local proxy="${1:-}" t t0 el max="${WARP_READY_MAX:-30}" fixed8=0 fixed18=0
     [ -z "$proxy" ] && return 0
-    for i in $(seq 1 25); do
-        t="$(curl -s --max-time 3 --proxy "$proxy" "$TRACE_URL" 2>/dev/null || true)"
-        if echo "$t" | grep -qE '^warp=(on|plus)'; then return 0; fi
-        # sau ~12s chưa lên: nối lại WARP một lần (proxy mode, không đụng tunnel)
-        if [ "$i" -eq 12 ] && [ -n "${WARP_BIN:-}" ]; then
-            "$WARP_BIN" mode proxy >/dev/null 2>&1 || true
-            "$WARP_BIN" --accept-tos connect >/dev/null 2>&1 || true
+    t0=$(date +%s)
+    while true; do
+        t="$(curl -s --connect-timeout 2 --max-time 3 --proxy "$proxy" "$TRACE_URL" 2>/dev/null || true)"
+        el=$(( $(date +%s) - t0 ))
+        if echo "$t" | grep -qE '^warp=(on|plus)'; then
+            log "warp ready in ${el}s" warp; return 0
+        fi
+        [ "$el" -ge "$max" ] && break
+        # kẹt (proxy mở nhưng không ra được Cloudflare, "Network: unstable"): connect đơn thuần không gỡ được,
+        # phải disconnect rồi connect lại. Chỉ làm khi đang ở proxy mode (không đụng tunnel/SSH). Tính theo giây thật.
+        if [ -n "${WARP_BIN:-}" ] && { { [ "$el" -ge 8 ] && [ "$fixed8" = 0 ] && fixed8=1; } || { [ "$el" -ge 18 ] && [ "$fixed18" = 0 ] && fixed18=1; }; }; then
+            if "$WARP_BIN" settings 2>/dev/null | grep -qiE 'Mode:[[:space:]]*WarpProxy'; then
+                log "wait_warp_ready: kẹt ${el}s — disconnect/connect" warp
+                "$WARP_BIN" disconnect >/dev/null 2>&1 || true
+                sleep 1
+                "$WARP_BIN" --accept-tos connect >/dev/null 2>&1 || true
+            fi
         fi
         sleep 1
     done
-    echo -e "${C_WARN}  [!] Tunnel WARP chưa ổn định sau ~25s — vẫn tiếp tục.${C_RST}"
+    echo -e "${C_WARN}  [!] Tunnel WARP chưa ổn định sau ${max}s — vẫn tiếp tục.${C_RST}"
+    log "warp NOT ready after ${max}s" warp
     return 1
 }
 
