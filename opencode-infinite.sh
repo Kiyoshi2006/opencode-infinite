@@ -386,7 +386,8 @@ wait_warp_ready() {
 # Dải IP đã bị limit (WARP cấp IP khác nhau nhưng cùng /64 → server limit cả dải)
 # ---------------------------------------------------------------
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
-BURN_TTL=86400          # nhớ dải bị limit trong 24h
+BURN_TTL=86400          # nhớ dải bị limit trong 24h (khi không biết giờ reset)
+BURN_MARGIN=180         # khi biết giờ reset từ OpenCode: giữ blacklist tới (giờ reset + ngần này giây)
 BURN_REROLL_MAX=0       # số lần đổi lại tối đa để ra khỏi dải đã burn (0 = vô hạn)
 
 ip_prefix() {
@@ -398,12 +399,13 @@ ip_prefix() {
     esac
 }
 
+# burn_mark <ip> [epoch_hết_hạn]: có epoch thì dải bị chặn tới đó, không có thì BURN_TTL
 burn_mark() {
-    local p; p="$(ip_prefix "${1:-}")"
+    local p; p="$(ip_prefix "${1:-}")" exp="${2:-}"
     [ -z "$p" ] && return 0
     mkdir -p "$STATE_DIR"
-    echo "$(date +%s) $p" >> "$BURN_FILE" 2>/dev/null || true
-    log "burn mark prefix=$p" burn
+    echo "$(date +%s) $p${exp:+ $exp}" >> "$BURN_FILE" 2>/dev/null || true
+    log "burn mark prefix=$p${exp:+ until=$exp}" burn
     return 0
 }
 
@@ -411,7 +413,7 @@ burn_is() {
     local p; p="$(ip_prefix "${1:-}")"
     [ -z "$p" ] && return 1
     [ -f "$BURN_FILE" ] || return 1
-    awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$1 > n - t && $2 == p { f = 1 } END { exit !f }' "$BURN_FILE"
+    awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$2 == p && ( ($3 != "" && $3 > n) || ($3 == "" && $1 > n - t) ) { f = 1 } END { exit !f }' "$BURN_FILE"
 }
 
 warp_rotate() {
@@ -1564,7 +1566,7 @@ guard_probe() {
 }
 
 # Đọc giờ reset free-limit từ DB OpenCode (chỉ đọc): lỗi limit mới nhất có error.retryAfterMs; reset = time.created + retryAfterMs.
-# In ra: "<epoch_giây> <HH:MM giờ máy>"; không đọc được thì không in gì (return 1).
+# In ra: "<epoch_reset> <HH:MM giờ máy> <epoch_lúc_lỗi>"; không đọc được thì không in gì (return 1).
 limit_reset_info() {
     local db="${OC_DB:-$HOME/.local/share/opencode/opencode.db}"
     [ -f "$db" ] && command -v python3 >/dev/null 2>&1 || return 1
@@ -1580,7 +1582,7 @@ try:
         t = (d.get("time") or {}).get("completed") or (d.get("time") or {}).get("created")
         if ra and t:
             r = (int(t) + int(ra)) // 1000
-            print(r, time.strftime("%H:%M", time.localtime(r)))
+            print(r, time.strftime("%H:%M", time.localtime(r)), int(t) // 1000)
             break
     else:
         sys.exit(1)
@@ -1726,16 +1728,19 @@ guard_main() {
             echo "[$(date '+%H:%M:%S')] LIMIT — session: ${sids:-không rõ}"
             net_steps=0
             guard_kill_resumes
-            burn_mark "$IP"
-            rinfo="$(limit_reset_info || true)"
+            rinfo="$(limit_reset_info || true)"; rexp=""
             if [ -n "$rinfo" ]; then
-                rleft=$(( ${rinfo%% *} - $(date +%s) ))
-                if [ "$rleft" -gt 0 ]; then
-                    echo "    reset lúc ${rinfo#* } (còn $(( rleft / 3600 ))h$(( rleft % 3600 / 60 ))m) — giờ OpenCode báo cho IP vừa bị chặn"
+                rnow="$(date +%s)"; rat="${rinfo%% *}"; rcr="${rinfo##* }"; rhm="${rinfo#* }"; rhm="${rhm%% *}"
+                rleft=$(( rat - rnow ))
+                # chỉ tin khi lỗi vừa xảy ra (≤3 phút) và giờ reset hợp lý (còn >0 và ≤48h); không thì dùng BURN_TTL
+                if [ $(( rnow - rcr )) -le 180 ] && [ "$rleft" -gt 0 ] && [ "$rleft" -le 172800 ]; then
+                    rexp=$(( rat + BURN_MARGIN ))
+                    echo "    reset lúc $rhm (còn $(( rleft / 3600 ))h$(( rleft % 3600 / 60 ))m) — IP ${IP:-?} bị chặn tới $(date -d "@$rexp" +%H:%M) (reset +$(( BURN_MARGIN / 60 ))p)"
                 else
-                    echo "    reset lúc ${rinfo#* } (đã qua)"
+                    echo "    reset lúc $rhm — số này cũ/không hợp lệ, chặn IP theo mặc định 24h"
                 fi
             fi
+            burn_mark "$IP" "$rexp"
             touch "$STATE_DIR/rotating.flag"
             guard_rotate_until_ok "guard"
             rm -f "$STATE_DIR/rotating.flag"
@@ -2009,7 +2014,7 @@ main() {
         --hermes-check)    hermes_check; return ;;
         --rotate-once)     rotate_once; return ;;
         --probe-once)      probe_once; return ;;
-        --reset-info)      ri="$(limit_reset_info || true)"; if [ -n "$ri" ]; then rl=$(( ${ri%% *} - $(date +%s) )); echo "reset lúc ${ri#* } — còn $(( rl / 3600 ))h$(( rl % 3600 / 60 ))m (epoch ${ri%% *})"; else echo "không đọc được giờ reset từ DB"; fi; return ;;
+        --reset-info)      ri="$(limit_reset_info || true)"; if [ -n "$ri" ]; then rl=$(( ${ri%% *} - $(date +%s) )); ri="${ri% *}"; echo "reset lúc ${ri#* } — còn $(( rl / 3600 ))h$(( rl % 3600 / 60 ))m (epoch ${ri%% *})"; else echo "không đọc được giờ reset từ DB"; fi; return ;;
         --hermes-test-read)    hermes_test_read "${2:-600}"; return ;;
         --hermes-test-session) hermes_test_session; return ;;
         --hermes-test-send)    mkdir -p "$STATE_DIR"; hermes_send_retry; return ;;
