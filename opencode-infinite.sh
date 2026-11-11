@@ -398,6 +398,7 @@ wait_warp_ready() {
 # ---------------------------------------------------------------
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
 BURN_TTL=86400          # nhớ dải bị limit trong 24h (khi không biết giờ reset)
+RESET_FILE="$STATE_DIR/last_reset.txt"   # giờ reset gần nhất đọc được từ OpenCode (epoch, đã cộng BURN_MARGIN)
 BURN_MARGIN=180         # khi biết giờ reset từ OpenCode: giữ blacklist tới (giờ reset + ngần này giây)
 BURN_REROLL_MAX=0       # số lần đổi lại tối đa để ra khỏi dải đã burn (0 = vô hạn)
 
@@ -415,6 +416,17 @@ burn_mark() {
     local p; p="$(ip_prefix "${1:-}")" exp="${2:-}"
     [ -z "$p" ] && return 0
     mkdir -p "$STATE_DIR"
+    # không có giờ reset riêng (vd. dải bị probe đánh dấu): dùng giờ reset đã biết, suy ra sang các ngày sau
+    # (quota reset mỗi ngày quanh cùng giờ). Chưa có dữ liệu / quá cũ (>7 ngày) thì để BURN_TTL.
+    if [ -z "$exp" ] && [ -f "$RESET_FILE" ]; then
+        local lr now k; lr="$(head -1 "$RESET_FILE" 2>/dev/null | tr -dc '0-9')"; now="$(date +%s)"
+        if [ -n "$lr" ] && [ $(( now - lr )) -lt 604800 ]; then
+            if [ "$lr" -gt "$now" ]; then exp="$lr"
+            else k=$(( (now - lr) / 86400 + 1 )); exp=$(( lr + k * 86400 )); fi
+            # không bao giờ chặn lâu hơn 48h
+            [ $(( exp - now )) -le 172800 ] || exp=""
+        fi
+    fi
     echo "$(date +%s) $p${exp:+ $exp}" >> "$BURN_FILE" 2>/dev/null || true
     log "burn mark prefix=$p${exp:+ until=$exp}" burn
     return 0
@@ -1746,6 +1758,7 @@ guard_main() {
                 # chỉ tin khi lỗi vừa xảy ra (≤3 phút) và giờ reset hợp lý (còn >0 và ≤48h); không thì dùng BURN_TTL
                 if [ $(( rnow - rcr )) -le 180 ] && [ "$rleft" -gt 0 ] && [ "$rleft" -le 172800 ]; then
                     rexp=$(( rat + BURN_MARGIN ))
+                    printf '%s\n' "$rexp" > "$RESET_FILE" 2>/dev/null || true
                     echo "    reset lúc $rhm (còn $(( rleft / 3600 ))h$(( rleft % 3600 / 60 ))m) — IP ${IP:-?} bị chặn tới $(date -d "@$rexp" +%H:%M) (reset +$(( BURN_MARGIN / 60 ))p)"
                 else
                     echo "    reset lúc $rhm — số này cũ/không hợp lệ, chặn IP theo mặc định 24h"
