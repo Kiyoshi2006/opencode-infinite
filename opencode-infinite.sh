@@ -1563,6 +1563,32 @@ guard_probe() {
     return 2
 }
 
+# Đọc giờ reset free-limit từ DB OpenCode (chỉ đọc): lỗi limit mới nhất có error.retryAfterMs; reset = time.created + retryAfterMs.
+# In ra: "<epoch_giây> <HH:MM giờ máy>"; không đọc được thì không in gì (return 1).
+limit_reset_info() {
+    local db="${OC_DB:-$HOME/.local/share/opencode/opencode.db}"
+    [ -f "$db" ] && command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$db" <<'PY' 2>/dev/null
+import sqlite3, sys, json, time
+try:
+    c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=3)
+    for (v,) in c.execute("select data from session_message where data like '%retryAfterMs%' order by rowid desc limit 40"):
+        try: d = json.loads(v)
+        except Exception: continue
+        e = d.get("error") or {}
+        ra = e.get("retryAfterMs")
+        t = (d.get("time") or {}).get("completed") or (d.get("time") or {}).get("created")
+        if ra and t:
+            r = (int(t) + int(ra)) // 1000
+            print(r, time.strftime("%H:%M", time.localtime(r)))
+            break
+    else:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
 # Xoay IP rồi thử nhẹ tới khi IP trả lời "ok" mới trả về (khi đó mới đáng khởi động lại bot + continue).
 # GUARD_PROBE=0 tắt; GUARD_PROBE_MAX=0 = thử vô hạn.
 guard_rotate_until_ok() {
@@ -1701,6 +1727,15 @@ guard_main() {
             net_steps=0
             guard_kill_resumes
             burn_mark "$IP"
+            rinfo="$(limit_reset_info || true)"
+            if [ -n "$rinfo" ]; then
+                rleft=$(( ${rinfo%% *} - $(date +%s) ))
+                if [ "$rleft" -gt 0 ]; then
+                    echo "    reset lúc ${rinfo#* } (còn $(( rleft / 3600 ))h$(( rleft % 3600 / 60 ))m) — giờ OpenCode báo cho IP vừa bị chặn"
+                else
+                    echo "    reset lúc ${rinfo#* } (đã qua)"
+                fi
+            fi
             touch "$STATE_DIR/rotating.flag"
             guard_rotate_until_ok "guard"
             rm -f "$STATE_DIR/rotating.flag"
@@ -1974,6 +2009,7 @@ main() {
         --hermes-check)    hermes_check; return ;;
         --rotate-once)     rotate_once; return ;;
         --probe-once)      probe_once; return ;;
+        --reset-info)      ri="$(limit_reset_info || true)"; if [ -n "$ri" ]; then rl=$(( ${ri%% *} - $(date +%s) )); echo "reset lúc ${ri#* } — còn $(( rl / 3600 ))h$(( rl % 3600 / 60 ))m (epoch ${ri%% *})"; else echo "không đọc được giờ reset từ DB"; fi; return ;;
         --hermes-test-read)    hermes_test_read "${2:-600}"; return ;;
         --hermes-test-session) hermes_test_session; return ;;
         --hermes-test-send)    mkdir -p "$STATE_DIR"; hermes_send_retry; return ;;
