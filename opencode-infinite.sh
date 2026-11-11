@@ -338,6 +338,8 @@ warp_up() {
     # (hoặc khi WARP_USE_BRIDGE=1).
     local t
     ACTIVE_PROXY=""
+    # vừa connect thì đường hầm cần vài giây-chục giây mới thông: chờ (lặp 1s, nối lại ở giây 12) thay vì thử đúng 1 lần
+    [ "$WARP_USE_BRIDGE" != "1" ] && { wait_warp_ready "http://127.0.0.1:$PROXY_PORT" >/dev/null 2>&1 || true; }
     if [ "$WARP_USE_BRIDGE" != "1" ]; then
         t="$(curl -s --max-time 10 --proxy "http://127.0.0.1:$PROXY_PORT" "$TRACE_URL" 2>/dev/null || true)"
         if echo "$t" | grep -qE '^warp=(on|plus)'; then
@@ -1027,6 +1029,7 @@ rotate() {
             return 1
         fi
         local prev_ip="${IP:-}" same=0
+        [ -n "${ACTIVE_PROXY:-}" ] || ACTIVE_PROXY="http://127.0.0.1:${PROXY_PORT:-40000}"
         warp_rotate
         [ "${FAST_ROTATE:-1}" = "1" ] || sleep "$ROTATE_COOLDOWN"
         wait_warp_ready "$ACTIVE_PROXY" || true
@@ -1410,6 +1413,12 @@ GUARD_RESUME_PIDS=""
 
 guard_service_pid() { pgrep -f 'opencode serve --service' 2>/dev/null | head -1 || true; }
 
+guard_service_has_proxy() {   # 0 = server đang chạy có HTTPS_PROXY = proxy hiện tại
+    local pid; pid="$(guard_service_pid)"
+    [ -n "$pid" ] && [ -n "${ACTIVE_PROXY:-}" ] || return 1
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "HTTPS_PROXY=$ACTIVE_PROXY"
+}
+
 guard_start_service() {
     pkill -f 'opencode serve --service' 2>/dev/null || true
     sleep 2
@@ -1605,6 +1614,15 @@ guard_main() {
         [ -z "$WARP_BIN" ] && { echo "guard: chưa cài WARP" >&2; exit 1; }
         warp_check_tunnel_danger || exit 1
         egress_connect || exit 1
+        # proxy rỗng = mọi thứ sẽ đo/chạy bằng IP thật của VPS (đã bị đốt) → tuyệt đối không chạy tiếp như vậy
+        local _g=0
+        while [ -z "${ACTIVE_PROXY:-}" ] && [ "$_g" -lt 5 ]; do
+            _g=$(( _g + 1 ))
+            echo "guard: proxy WARP chưa ra được Cloudflare — nối lại (lần $_g/5)"
+            warp_cmd disconnect; sleep 2; warp_cmd connect
+            warp_up || true
+        done
+        [ -n "${ACTIVE_PROXY:-}" ] || { echo "guard: WARP chưa dùng được — thoát, systemd sẽ khởi động lại" >&2; exit 1; }
         WARP_UP=1
         ;;
     TOR|PROXY)   # chưa thử trên máy thật — xem README
@@ -1616,7 +1634,8 @@ guard_main() {
     echo "[guard] chạy. IP=$IP proxy=$ACTIVE_PROXY log=$LOGFILE"
     log "guard start ip=$IP" guard
     # server phải chạy qua proxy WARP: nếu chưa có thì dựng lại
-    if [ -z "$(guard_service_pid)" ]; then guard_start_service; fi
+    # server phải chạy qua proxy WARP: chưa có, hoặc đang chạy mà KHÔNG mang biến proxy hiện tại → dựng lại + gắn lại bot
+    if [ -z "$(guard_service_pid)" ] || ! guard_service_has_proxy; then guard_start_service; guard_restart_bot || true; fi
     health_start
 
     local off size chunk hits sids net_steps=0 last_act=0 streak=0 bot_pending=0 boff=0
