@@ -1536,6 +1536,46 @@ hermes_scan() {
     HERMES_HIT="$out"
 }
 
+# Thử nhẹ một IP: hỏi OpenCode (qua proxy hiện tại) "reply with the word ok".
+# 0 = trả lời ok (IP dùng được), 1 = bị limit, 2 = lỗi khác (mạng/timeout). Không đụng bot Telegram.
+guard_probe() {
+    local proxy="${ACTIVE_PROXY:-}" out sid model="${GUARD_PROBE_MODEL:-opencode/deepseek-v4.1-flash-free}"
+    local pa=()
+    [ -n "$proxy" ] && pa=(HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" http_proxy="$proxy" https_proxy="$proxy" NO_PROXY="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}" no_proxy="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}")
+    out="$(cd "$HOME" && timeout -k 5 "${GUARD_PROBE_TIMEOUT:-45}" env "${pa[@]}" "$OC_CMD" run --standalone --format json -m "$model" "reply with the word ok" 2>&1 || true)"
+    sid="$(printf '%s' "$out" | grep -o 'ses_[A-Za-z0-9]*' | head -n1)"
+    [ -n "$sid" ] && "$OC_CMD" session delete "$sid" >/dev/null 2>&1 || true
+    log "probe ip=${IP:-?} out=$(printf '%s' "$out" | tr '\n' ' ' | head -c 300)" guard
+    if printf '%s' "$out" | grep -qiE "$OC_PAT|used today|free messages|usage limit"; then return 1; fi
+    # bỏ chính câu lệnh ra khỏi kết quả (có thể bị lặp lại trong sự kiện) rồi tìm chữ "ok" do model trả lời
+    if printf '%s' "$out" | sed 's/reply with the word ok//Ig' | grep -qiE '(^|[^A-Za-z])ok([^A-Za-z]|$)'; then return 0; fi
+    return 2
+}
+
+# Xoay IP rồi thử nhẹ tới khi IP trả lời "ok" mới trả về (khi đó mới đáng khởi động lại bot + continue).
+# GUARD_PROBE=0 tắt; GUARD_PROBE_MAX=0 = thử vô hạn.
+guard_rotate_until_ok() {
+    local why="${1:-guard}" n=0 rc
+    rotate "$why" || true
+    [ "${GUARD_PROBE:-1}" = "1" ] || return 0
+    while true; do
+        guard_probe; rc=$?
+        if [ "$rc" = 0 ]; then echo "    probe: IP ${IP:-?} trả lời ok"; return 0; fi
+        n=$(( n + 1 ))
+        if [ "$rc" = 1 ]; then
+            echo "    probe: IP ${IP:-?} bị limit — xoay tiếp (lần $n)"; burn_mark "${IP:-}"
+        else
+            echo "    probe: lỗi mạng/timeout (lần $n) — xoay tiếp"
+        fi
+        if [ "${GUARD_PROBE_MAX:-0}" -gt 0 ] && [ "$n" -ge "$GUARD_PROBE_MAX" ]; then
+            echo "    probe: đã thử $n lần — dừng thử, gửi continue luôn"; return 0
+        fi
+        # nhiều lần liền đều limit = có thể cả dải đã cạn: nghỉ giữa các lần để không đốt hết IP
+        if [ "$n" -ge "${GUARD_PROBE_SLOW_AFTER:-20}" ]; then sleep "${GUARD_PROBE_SLOW_SLEEP:-120}"; fi
+        rotate "${why}-probe" || true
+    done
+}
+
 guard_main() {
     mkdir -p "$STATE_DIR"
     trap 'rm -f "$GUARD_PID_FILE"; health_stop; exit 0' TERM INT
@@ -1546,12 +1586,21 @@ guard_main() {
     detect_caps
     [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] || GUARD_NOKILL=1   # không giết/dựng lại server mỗi lần xoay
     CAP_STANDALONE=""     # PHẢI dùng server dùng chung (để Telegram thấy), không dùng server riêng
-    EGRESS=WARP
-    find_warp
-    [ -z "$WARP_BIN" ] && { echo "guard: chưa cài WARP" >&2; exit 1; }
-    warp_check_tunnel_danger || exit 1
-    egress_connect || exit 1
-    WARP_UP=1
+    EGRESS="${GUARD_EGRESS:-WARP}"
+    case "$EGRESS" in
+    WARP)
+        find_warp
+        [ -z "$WARP_BIN" ] && { echo "guard: chưa cài WARP" >&2; exit 1; }
+        warp_check_tunnel_danger || exit 1
+        egress_connect || exit 1
+        WARP_UP=1
+        ;;
+    TOR|PROXY)   # chưa thử trên máy thật — xem README
+        egress_connect || exit 1
+        [ -n "${ACTIVE_PROXY:-}" ] || { echo "guard: $EGRESS không dựng được proxy" >&2; exit 1; }
+        ;;
+    *) echo "guard: GUARD_EGRESS phải là WARP, TOR hoặc PROXY" >&2; exit 1 ;;
+    esac
     echo "[guard] chạy. IP=$IP proxy=$ACTIVE_PROXY log=$LOGFILE"
     log "guard start ip=$IP" guard
     # server phải chạy qua proxy WARP: nếu chưa có thì dựng lại
@@ -1574,7 +1623,7 @@ guard_main() {
             guard_kill_resumes
             burn_mark "$IP"
             touch "$STATE_DIR/rotating.flag"
-            rotate "guard-hermes" || true
+            guard_rotate_until_ok "guard-hermes"
             # IP trống (WARP chưa sẵn sàng) thì xoay thêm tối đa 2 lần — chỉ ở nhánh Hermes, không đụng nhánh OpenCode
             local _hr=0
             while [ -z "${IP:-}" ] && [ "$_hr" -lt 2 ]; do _hr=$(( _hr + 1 )); rotate "guard-hermes-retry" || true; done
@@ -1622,7 +1671,7 @@ guard_main() {
             guard_kill_resumes
             burn_mark "$IP"
             touch "$STATE_DIR/rotating.flag"
-            rotate "guard" || true
+            guard_rotate_until_ok "guard"
             rm -f "$STATE_DIR/rotating.flag"
             token_reset quiet
             [ "${GUARD_RESTART_SERVICE:-1}" = "1" ] && guard_start_service
