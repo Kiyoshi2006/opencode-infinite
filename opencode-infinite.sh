@@ -1580,8 +1580,21 @@ guard_probe() {
     [ -n "$proxy" ] && pa=(HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" http_proxy="$proxy" https_proxy="$proxy" NO_PROXY="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}" no_proxy="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}")
     out="$(cd "$HOME" && timeout -k 5 "${GUARD_PROBE_TIMEOUT:-25}" env "${pa[@]}" "$OC_CMD" run --standalone --format json -m "$model" "reply with the word ok" 2>&1 || true)"
     sid="$(printf '%s' "$out" | grep -o 'ses_[A-Za-z0-9]*' | head -n1)"
+    # IP vừa thử bị limit: OpenCode đã ghi retryAfterMs vào DB cho session probe → đọc giờ reset RIÊNG của dải này trước khi xoá session
+    PROBE_RESET_EXP=""
+    if printf '%s' "$out" | grep -qiE "$OC_PAT|used today|free messages|usage limit"; then
+        local pi pnow pat pcr
+        pi="$(limit_reset_info "${sid:-}" || true)"
+        if [ -n "$pi" ]; then
+            pnow="$(date +%s)"; pat="${pi%% *}"; pcr="${pi##* }"
+            if [ $(( pnow - pcr )) -le 120 ] && [ "$pat" -gt "$pnow" ] && [ $(( pat - pnow )) -le 172800 ]; then
+                PROBE_RESET_EXP=$(( pat + BURN_MARGIN ))
+                echo "    probe: reset lúc $(date -d "@$pat" +%H:%M) (còn $(( (pat - pnow) / 3600 ))h$(( (pat - pnow) % 3600 / 60 ))m)"
+            fi
+        fi
+    fi
     [ -n "$sid" ] && "$OC_CMD" session delete "$sid" >/dev/null 2>&1 || true
-    log "probe ip=${IP:-?} out=$(printf '%s' "$out" | tr '\n' ' ' | head -c 300)" guard
+    log "probe ip=${IP:-?} reset_exp=${PROBE_RESET_EXP:-none} out=$(printf '%s' "$out" | tr '\n' ' ' | head -c 300)" guard
     if printf '%s' "$out" | grep -qiE "$OC_PAT|used today|free messages|usage limit"; then return 1; fi
     # bỏ chính câu lệnh ra khỏi kết quả (có thể bị lặp lại trong sự kiện) rồi tìm chữ "ok" do model trả lời
     if printf '%s' "$out" | sed 's/reply with the word ok//Ig' | grep -qiE '(^|[^A-Za-z])ok([^A-Za-z]|$)'; then return 0; fi
@@ -1593,11 +1606,17 @@ guard_probe() {
 limit_reset_info() {
     local db="${OC_DB:-$HOME/.local/share/opencode/opencode.db}"
     [ -f "$db" ] && command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "$db" <<'PY' 2>/dev/null
+    python3 - "$db" "${1:-}" <<'PY' 2>/dev/null
 import sqlite3, sys, json, time
 try:
     c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=3)
-    for (v,) in c.execute("select data from session_message where data like '%retryAfterMs%' order by rowid desc limit 40"):
+    sid = sys.argv[2] if len(sys.argv) > 2 else ""
+    cols = [r[1] for r in c.execute("pragma table_info(session_message)")]
+    q = "select data from session_message where data like '%retryAfterMs%'"
+    args = ()
+    if sid and "session_id" in cols:
+        q += " and session_id = ?"; args = (sid,)
+    for (v,) in c.execute(q + " order by rowid desc limit 40", args):
         try: d = json.loads(v)
         except Exception: continue
         e = d.get("error") or {}
@@ -1626,7 +1645,7 @@ guard_rotate_until_ok() {
         n=$(( n + 1 ))
         if [ "$rc" = 1 ]; then
             neterr=0
-            echo "    probe: IP ${IP:-?} bị limit — xoay tiếp (lần $n)"; burn_mark "${IP:-}"
+            echo "    probe: IP ${IP:-?} bị limit — xoay tiếp (lần $n)"; burn_mark "${IP:-}" "${PROBE_RESET_EXP:-}"
         else
             # lỗi mạng ≠ IP limit: WARP đang kẹt. Xoay lúc này chỉ đăng ký thêm tài khoản (dễ bị Cloudflare giới hạn),
             # nên nối lại WARP trước (không đăng ký mới); lỗi 3 lần liền mới xoay.
