@@ -1570,8 +1570,8 @@ guard_rotate_until_ok() {
         if [ "${GUARD_PROBE_MAX:-0}" -gt 0 ] && [ "$n" -ge "$GUARD_PROBE_MAX" ]; then
             echo "    probe: đã thử $n lần — dừng thử, gửi continue luôn"; return 0
         fi
-        # nhiều lần liền đều limit = có thể cả dải đã cạn: nghỉ giữa các lần để không đốt hết IP
-        if [ "$n" -ge "${GUARD_PROBE_SLOW_AFTER:-20}" ]; then sleep "${GUARD_PROBE_SLOW_SLEEP:-120}"; fi
+        # GUARD_PROBE_SLOW_AFTER=N (>0): sau N lần liền đều limit thì nghỉ giữa các lần. Mặc định 0 = không nghỉ, thử vô hạn
+        if [ "${GUARD_PROBE_SLOW_AFTER:-0}" -gt 0 ] && [ "$n" -ge "$GUARD_PROBE_SLOW_AFTER" ]; then sleep "${GUARD_PROBE_SLOW_SLEEP:-120}"; fi
         rotate "${why}-probe" || true
     done
 }
