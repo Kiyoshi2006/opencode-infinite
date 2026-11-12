@@ -366,7 +366,7 @@ warp_up() {
 # Chờ proxy thật sự ra Cloudflare (warp=on) trước khi mở OpenCode — tránh 502/ECONNRESET
 # khi tunnel vừa (re)connect còn "unstable".
 wait_warp_ready() {
-    local proxy="${1:-}" t t0 el max="${WARP_READY_MAX:-30}" fixed8=0 fixed18=0
+    local proxy="${1:-}" t t0 el max="${WARP_READY_MAX:-15}" fixed8=0 fixed18=0
     [ -z "$proxy" ] && return 0
     t0=$(date +%s)
     while true; do
@@ -448,20 +448,13 @@ warp_rotate() {
     if [ "${FAST_ROTATE:-1}" != "1" ]; then sleep 2; fi
     warp_cmd --accept-tos registration new
     REG_FAIL=0
-    # đăng ký lỗi (API Cloudflare nghẽn) = WARP không còn tài khoản → chờ tunnel là vô ích. Thử đăng ký lại ngay,
-    # cách nhau 3,4,5…s (tối đa WARP_REG_RETRIES lần), chỉ khi vẫn lỗi mới đi tiếp như cũ.
-    local _try=0 _max="${WARP_REG_RETRIES:-6}"
-    while echo "${WARP_LAST:-}" | grep -qiE 'error|fail|too many|rate|limit|unable' || ! warp_is_registered; do
-        _try=$(( _try + 1 ))
-        log "warp registration retry $_try/$_max: ${WARP_LAST:-}" warp
-        if [ "$_try" -gt "$_max" ]; then
-            REG_FAIL=1; echo "    [warp] đăng ký vẫn lỗi sau $_max lần thử lại — bỏ qua"; break
-        fi
-        echo "    [warp] registration new báo lỗi: $(echo "${WARP_LAST:-}" | head -c 120) (thử lại $_try/$_max)"
-        sleep $(( _try + 2 ))
-        warp_cmd --accept-tos registration new
-    done
-    [ "$_try" -gt 0 ] && [ "$REG_FAIL" = 0 ] && echo "    [warp] đăng ký lại thành công sau $_try lần"
+    # đăng ký lỗi (API Cloudflare nghẽn / WARP không có tài khoản): báo REG_FAIL rồi thoát ngay, người gọi nghỉ rồi xoay lại
+    if echo "${WARP_LAST:-}" | grep -qiE 'error|fail|too many|rate|limit|unable' || ! warp_is_registered; then
+        REG_FAIL=1
+        echo "    [warp] đăng ký lỗi: $(echo "${WARP_LAST:-}" | head -c 120)"
+        log "warp rotate: registration FAIL: ${WARP_LAST:-}" warp
+        return 0
+    fi
     log "warp rotate: registration done fail=$REG_FAIL" warp
     sleep "$ROTATE_COOLDOWN"
     # PHẢI set proxy mode trước khi connect (tránh tunnel mode → mất SSH)
@@ -470,6 +463,24 @@ warp_rotate() {
     warp_cmd connect
     if [ "${FAST_ROTATE:-1}" != "1" ]; then sleep "$WARP_WAIT"; fi
     log "warp rotated in $(( $(date +%s) - _t0 ))s" warp
+}
+
+# Xoay + lấy IP. Bất kỳ lỗi nào ngoài limit (đăng ký lỗi, IP trống, proxy chưa lên): nghỉ ROTATE_ERR_SLEEP giây rồi xoay lại, vô hạn.
+warp_rotate_get_ip() {
+    local fails=0
+    while true; do
+        warp_rotate
+        if [ "${REG_FAIL:-0}" = 1 ]; then
+            IP=""
+        else
+            wait_warp_ready "$ACTIVE_PROXY" || true
+            get_ip "$ACTIVE_PROXY"
+        fi
+        [ -n "${IP:-}" ] && return 0
+        fails=$(( fails + 1 ))
+        echo "    lỗi (đăng ký/IP trống) lần $fails — nghỉ ${ROTATE_ERR_SLEEP:-10}s rồi xoay lại"
+        sleep "${ROTATE_ERR_SLEEP:-10}"
+    done
 }
 
 # ---------------------------------------------------------------
@@ -1065,41 +1076,16 @@ rotate() {
         fi
         local prev_ip="${IP:-}" same=0
         [ -n "${ACTIVE_PROXY:-}" ] || ACTIVE_PROXY="http://127.0.0.1:${PROXY_PORT:-40000}"
-        warp_rotate
-        [ "${FAST_ROTATE:-1}" = "1" ] || sleep "$ROTATE_COOLDOWN"
-        wait_warp_ready "$ACTIVE_PROXY" || true
-        get_ip "$ACTIVE_PROXY"
-        local reroll=0 empty=0
-        # lặp khi IP rỗng (proxy chưa lên, tối đa 3 lần liền) HOẶC IP thuộc dải đã bị limit
-        while { [ -z "${IP:-}" ] && [ "$empty" -lt 3 ]; } || { burn_is "${IP:-}" && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; }; do
-            if [ -z "${IP:-}" ]; then
-                empty=$(( empty + 1 ))
-                echo "    chưa lấy được IP (proxy WARP chưa lên) — thử lại (lần $empty/3)..."
-                if [ "$empty" -lt 3 ]; then
-                    warp_cmd mode proxy; warp_cmd proxy port 40000; warp_cmd connect   # nối lại, chưa cần đăng ký mới
-                else
-                    warp_rotate
-                fi
-                wait_warp_ready "$ACTIVE_PROXY" || true
-                get_ip "$ACTIVE_PROXY"
-                continue
-            fi
-            empty=0
+        warp_rotate_get_ip
+        local reroll=0
+        # IP thuộc dải đã bị limit (blacklist) thì xoay tiếp
+        while burn_is "${IP:-}" && { [ "$BURN_REROLL_MAX" -eq 0 ] || [ "$reroll" -lt "$BURN_REROLL_MAX" ]; }; do
             reroll=$(( reroll + 1 ))
             echo "    IP ${IP} thuộc dải đã bị limit — đổi tiếp (lần $reroll${BURN_REROLL_MAX/#0/ — vô hạn})..."
             prev_ip="$IP"
-            warp_rotate
-            [ "${FAST_ROTATE:-1}" = "1" ] || sleep "$ROTATE_COOLDOWN"
-            wait_warp_ready "$ACTIVE_PROXY" || true
-            get_ip "$ACTIVE_PROXY"
-            if [ -n "$IP" ] && [ "$IP" = "$prev_ip" ]; then
-                same=$(( same + 1 ))
-                local w=$(( same * 20 )); [ "$w" -gt 120 ] && w=120
-                echo "    [warp] vẫn IP cũ (WARP không cấp IP mới — có thể bị giới hạn đăng ký). Chờ ${w}s rồi thử lại..."
-                sleep "$w"
-            else
-                same=0
-            fi
+            warp_rotate_get_ip
+            # WARP cấp lại đúng IP cũ: nghỉ một nhịp cho khỏi quay vòng sát
+            if [ "$IP" = "$prev_ip" ]; then echo "    [warp] vẫn IP cũ — nghỉ ${ROTATE_ERR_SLEEP:-10}s"; sleep "${ROTATE_ERR_SLEEP:-10}"; fi
         done
         echo "    New IP: ${IP:-unknown}"
         ;;
@@ -1646,7 +1632,7 @@ PY
 # Xoay IP rồi thử nhẹ tới khi IP trả lời "ok" mới trả về (khi đó mới đáng khởi động lại bot + continue).
 # GUARD_PROBE=0 tắt; GUARD_PROBE_MAX=0 = thử vô hạn.
 guard_rotate_until_ok() {
-    local why="${1:-guard}" n=0 rc neterr=0
+    local why="${1:-guard}" n=0 rc
     rotate "$why" || true
     [ "${GUARD_PROBE:-1}" = "1" ] || return 0
     while true; do
@@ -1654,19 +1640,11 @@ guard_rotate_until_ok() {
         if [ "$rc" = 0 ]; then echo "    probe: IP ${IP:-?} trả lời ok"; return 0; fi
         n=$(( n + 1 ))
         if [ "$rc" = 1 ]; then
-            neterr=0
             echo "    probe: IP ${IP:-?} bị limit — xoay tiếp (lần $n)"; burn_mark "${IP:-}" "${PROBE_RESET_EXP:-}"
         else
-            # lỗi mạng ≠ IP limit: WARP đang kẹt. Xoay lúc này chỉ đăng ký thêm tài khoản (dễ bị Cloudflare giới hạn),
-            # nên nối lại WARP trước (không đăng ký mới); lỗi 3 lần liền mới xoay.
-            neterr=$(( neterr + 1 ))
-            if [ "$neterr" -le 2 ]; then
-                echo "    probe: lỗi mạng/timeout (lần $n) — nối lại WARP, chưa xoay"
-                warp_heal || true
-                continue
-            fi
-            neterr=0
-            echo "    probe: lỗi mạng liên tiếp (lần $n) — xoay"
+            # lỗi khác limit (mạng/timeout/không có proxy): nghỉ rồi xoay, không thử cách khác
+            echo "    probe: lỗi mạng/timeout (lần $n) — nghỉ ${ROTATE_ERR_SLEEP:-10}s rồi xoay"
+            sleep "${ROTATE_ERR_SLEEP:-10}"
         fi
         if [ "${GUARD_PROBE_MAX:-0}" -gt 0 ] && [ "$n" -ge "$GUARD_PROBE_MAX" ]; then
             echo "    probe: đã thử $n lần — dừng thử, gửi continue luôn"; return 0
