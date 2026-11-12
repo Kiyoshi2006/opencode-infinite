@@ -1790,10 +1790,16 @@ guard_main() {
                     printf '%s\n' "$rexp" > "$RESET_FILE" 2>/dev/null || true
                     echo "    reset lúc $rhm (còn $(( rleft / 3600 ))h$(( rleft % 3600 / 60 ))m) — IP ${IP:-?} bị chặn tới $(date -d "@$rexp" +%H:%M) (reset +$(( BURN_MARGIN / 60 ))p)"
                 else
-                    echo "    reset lúc $rhm — số này cũ/không hợp lệ, chặn IP theo mặc định 24h"
+                    echo "    reset lúc $rhm là của lần limit cũ, không dùng cho IP này"
                 fi
             fi
             burn_mark "$IP" "$rexp"
+            if [ -z "$rexp" ]; then
+                # lần limit này không có giờ reset trong DB (vd. Hermes/bridge không ghi DB): burn_mark đã dùng giờ reset chung đã lưu
+                bexp="$(tail -1 "$BURN_FILE" 2>/dev/null | awk '{print $3}')"
+                if [ -n "$bexp" ]; then echo "    không có giờ reset riêng — chặn IP tới $(date -d "@$bexp" +%H:%M) (giờ reset chung đã lưu)"
+                else echo "    không có giờ reset nào đã lưu — chặn IP 24h"; fi
+            fi
             touch "$STATE_DIR/rotating.flag"
             guard_rotate_until_ok "guard"
             rm -f "$STATE_DIR/rotating.flag"
