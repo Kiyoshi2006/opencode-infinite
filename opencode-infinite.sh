@@ -439,14 +439,21 @@ burn_is() {
     awk -v n="$(date +%s)" -v t="$BURN_TTL" -v p="$p" '$2 == p && ( ($3 != "" && $3 > n) || ($3 == "" && $1 > n - t) ) { f = 1 } END { exit !f }' "$BURN_FILE"
 }
 
+REG_LAST=0
 warp_rotate() {
     log "warp_rotate: start" warp
+    # Cloudflare giới hạn tần suất đăng ký (~6-9 lần dồn dập rồi khoá ~65s, "Failed to communicate with the WARP API").
+    # Giữ khoảng cách tối thiểu giữa 2 lần đăng ký để không chạm ngưỡng khoá. WARP_REG_MIN_GAP=0 để tắt.
+    local _gap="${WARP_REG_MIN_GAP:-10}" _w
+    _w=$(( REG_LAST + _gap - $(date +%s) ))
+    [ "$_w" -gt 0 ] && sleep "$_w"
     local _t0; _t0=$(date +%s)
     # FAST_ROTATE=1 (mặc định): như bản gốc của tác giả — không disconnect/sleep cố định, wait_warp_ready tự lặp. FAST_ROTATE=0: kiểu cũ.
     if [ "${FAST_ROTATE:-1}" != "1" ]; then warp_cmd disconnect; fi
     warp_cmd registration delete
     if [ "${FAST_ROTATE:-1}" != "1" ]; then sleep 2; fi
     warp_cmd --accept-tos registration new
+    REG_LAST=$(date +%s)
     REG_FAIL=0
     # đăng ký lỗi (API Cloudflare nghẽn / WARP không có tài khoản): báo REG_FAIL rồi thoát ngay, người gọi nghỉ rồi xoay lại
     if echo "${WARP_LAST:-}" | grep -qiE 'error|fail|too many|rate|limit|unable' || ! warp_is_registered; then
