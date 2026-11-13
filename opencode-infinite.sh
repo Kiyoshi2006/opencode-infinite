@@ -399,6 +399,7 @@ wait_warp_ready() {
 BURN_FILE="$STATE_DIR/burned_prefixes.txt"
 BURN_TTL=86400          # nhớ dải bị limit trong 24h (khi không biết giờ reset)
 RESET_FILE="$STATE_DIR/last_reset.txt"   # giờ reset gần nhất đọc được từ OpenCode (epoch, đã cộng BURN_MARGIN)
+HERMES_SIGNAL_FILE="$STATE_DIR/hermes-limit-signal"        # plugin Hermes ghi khi gặp 429 free tier
 BURN_MARGIN=180         # khi biết giờ reset từ OpenCode: giữ blacklist tới (giờ reset + ngần này giây)
 BURN_REROLL_MAX=0       # số lần đổi lại tối đa để ra khỏi dải đã burn (0 = vô hạn)
 
@@ -1534,30 +1535,144 @@ hermes_plugin_patched() {
     grep -q "OC_PROXY_PATCH" "$f" && grep -qE '^_OC_PX = .*127\.0\.0\.1:40000' "$f"
 }
 
-hermes_send_retry() {
-    local T="${HERMES_TMUX:-hermes}" before after k i ok=0
-    if ! command -v tmux >/dev/null 2>&1 || ! tmux has-session -t "$T" 2>/dev/null; then
-        echo "[$(date '+%H:%M:%S')] không thấy tmux '$T' — tự gõ /retry trong Hermes"; return 0
+hermes_find_chat() {
+    # Chat Telegram (dm) để gửi kết quả về — lượt /retry chạy qua gateway với source=local nên không tự sang Telegram.
+    local id=""
+    id="$(python3 - "$HOME/.hermes/channel_directory.json" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    for p in d.get("platforms", {}).get("telegram", []):
+        if p.get("type") == "dm" and p.get("id"):
+            print(p["id"]); break
+except Exception:
+    pass
+PYEOF
+)"
+    if [ -z "$id" ]; then
+        id="$(tail -n 500 "$HOME/.hermes/logs/gateway.log" 2>/dev/null | grep -oE 'platform=telegram [^ ]* chat=[0-9]+' | tail -1 | sed 's/.*chat=//' || true)"
     fi
-    sleep 2
-    tmux send-keys -t "$T" Escape 2>/dev/null; sleep 0.3
-    tmux send-keys -t "$T" C-u 2>/dev/null; sleep 0.3
-    tmux send-keys -t "$T" -l "/retry" 2>/dev/null; sleep 1.5
-    for i in 1 2 3 4; do
-        before="$(tmux capture-pane -p -t "$T" 2>/dev/null)"
-        case "$i" in 1|3) k=C-m;; 2) k=Enter;; 4) k=C-m;; esac
-        tmux send-keys -t "$T" "$k" 2>/dev/null; sleep 2.5
-        after="$(tmux capture-pane -p -t "$T" 2>/dev/null)"
-        if [ "$before" != "$after" ]; then ok=1; break; fi
-    done
-    tmux capture-pane -p -t "$T" 2>/dev/null | tail -25 > "$STATE_DIR/hermes-pane.txt"
-    if [ "$ok" = "1" ]; then echo "[$(date '+%H:%M:%S')] đã gõ /retry vào tmux '$T' (Enter lần $i, màn hình đã đổi)"
-    else echo "[$(date '+%H:%M:%S')] /retry KHÔNG có phản ứng sau 4 lần Enter — xem $STATE_DIR/hermes-pane.txt"; fi
+    printf '%s' "$id"
+}
+
+hermes_find_sid() {
+    # Session đang chat trên Telegram: tra state.db → gateway_routing theo chat id (đúng session hiện tại).
+    local sid="" chat db="${HERMES_STATE_DB:-$HOME/.hermes/state.db}"
+    chat="$(hermes_find_chat)"
+    if [ -n "$chat" ] && [ -f "$db" ]; then
+        sid="$(python3 - "$db" "telegram:dm:$chat" <<'PYEOF' 2>/dev/null || true
+import re, sqlite3, sys
+db, key = sys.argv[1], sys.argv[2]
+try:
+    c = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=3)
+    for _sk, entry in c.execute(
+        "select session_key, entry_json from gateway_routing where session_key like ? "
+        "order by updated_at desc limit 5", ("%" + key + "%",)
+    ):
+        m = re.search(r'"session_id":"([^"]+)"', entry or "")
+        if m:
+            print(m.group(1)); break
+except Exception:
+    pass
+PYEOF
+)"
+    fi
+    if [ -z "$sid" ] && [ -f "$HOME/.hermes/logs/gateway.log" ]; then
+        sid="$(tail -n 500 "$HOME/.hermes/logs/gateway.log" 2>/dev/null | grep -oE 'Transient agent failure in session [A-Za-z0-9_.-]+' | tail -1 | sed 's/.* in session //' || true)"
+    fi
+    printf '%s' "$sid"
+}
+
+hermes_pending() {
+    # In ra: running | pending | done | unknown (chỉ đọc state.db của Hermes)
+    local sid="${1:-}" db="${HERMES_STATE_DB:-$HOME/.hermes/state.db}"
+    { [ -n "$sid" ] && [ -f "$db" ]; } || { echo unknown; return 0; }
+    python3 - "$db" "$sid" <<'PYEOF' 2>/dev/null || echo unknown
+import json, sqlite3, sys
+db, sid = sys.argv[1], sys.argv[2]
+if not sid:
+    print("unknown"); raise SystemExit
+try:
+    c = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=3)
+except Exception:
+    print("unknown"); raise SystemExit
+for (ej,) in c.execute("select entry_json from gateway_routing where entry_json like ?",
+                       ("%" + sid + "%",)):
+    try:
+        d = json.loads(ej)
+    except Exception:
+        continue
+    if d.get("session_id") == sid and d.get("active_turn_started_at"):
+        print("running"); raise SystemExit
+row = c.execute("select role, content, timestamp from messages where session_id=? "
+                "order by rowid desc limit 1", (sid,)).fetchone()
+if not row:
+    print("unknown"); raise SystemExit
+role, content, _ts = row
+text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+if role in ("user", "tool"):
+    print("pending"); raise SystemExit
+low = (text or "").strip().lower()
+if low.startswith("your request was not processed") or "free usage limit" in low:
+    print("pending"); raise SystemExit
+print("done")
+PYEOF
+}
+
+hermes_retry_session() {
+    # /retry ĐÚNG session qua gateway (không tmux, không "continue"), rồi gửi câu trả lời về Telegram.
+    local sid="$1" chat="${2:-}" bin out lockf logf msg
+    bin="$HOME/.hermes/hermes-agent/.hermes/bin/hermes"
+    lockf="$STATE_DIR/hermes-retry.lock"
+    logf="$STATE_DIR/hermes-retry-${sid}.log"
+    [ -x "$bin" ] || { echo "[$(date '+%H:%M:%S')] không thấy $bin — bỏ /retry"; return 1; }
+    if [ -s "$lockf" ]; then
+        local lp; lp="$(cut -d' ' -f1 "$lockf" 2>/dev/null || true)"
+        if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then
+            echo "[$(date '+%H:%M:%S')] /retry $sid đang chạy (pid $lp) — không gửi trùng"; return 0
+        fi
+    fi
+    (
+        echo "$$ $sid" > "$lockf" 2>/dev/null || true
+        out="$(timeout 900 "$bin" chat --resume "$sid" -q "/retry" -Q 2>&1 || true)"
+        printf '%s\n' "$out" > "$logf" 2>/dev/null || true
+        msg="$(printf '%s\n' "$out" | grep -vE '^(session_id:|↻ Resumed session)' | sed '/^[[:space:]]*$/d' | head -c 3500 || true)"
+        if [ -n "$msg" ] && [ -n "$chat" ]; then
+            printf '%s\n' "$msg" | timeout 90 "$bin" send --to "telegram:$chat" -f - -q >/dev/null 2>&1 || true
+        fi
+        log "guard hermes retry done: sid=$sid chat=$chat bytes=${#msg}" guard
+        rm -f "$lockf" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
+    echo "[$(date '+%H:%M:%S')] IP mới OK — đã gửi /retry vào session $sid qua gateway (kết quả về Telegram ${chat:-?})"
+}
+
+hermes_send_retry() {
+    # Chỉ /retry khi session còn việc dở; không có việc dở thì không gửi gì (khỏi tốn token).
+    local sid chat st
+    sid="$(hermes_find_sid)"; chat="$(hermes_find_chat)"
+    if [ -z "$sid" ]; then
+        echo "[$(date '+%H:%M:%S')] không xác định được session Hermes — không gửi gì"
+        return 0
+    fi
+    st="$(hermes_pending "$sid")"
+    if [ "$st" != pending ]; then
+        echo "[$(date '+%H:%M:%S')] session $sid: $st — không gửi /retry"
+        log "hermes retry skip: sid=$sid state=$st" guard
+        return 0
+    fi
+    log "guard hermes: /retry via gateway sid=$sid chat=$chat" guard
+    hermes_retry_session "$sid" "$chat"
 }
 
 hermes_scan() {
-    local f sz off out="" got
-    HERMES_HIT=""; HERMES_HIT_SRC=""
+    local f sz off out="" got sig="$HERMES_SIGNAL_FILE"
+    HERMES_HIT=""; HERMES_HIT_SRC=""; HERMES_RESET_EXP=""
+    # Plugin Hermes ghi file này NGAY khi gặp 429 → guard thấy trong ~2s, không phải chờ Hermes bỏ cuộc.
+    if [ -s "$sig" ]; then
+        got="$(tail -c 4000 "$sig" 2>/dev/null | head -c 2000 || true)"
+        if [ -n "$got" ]; then HERMES_HIT_SRC+="$sig "; out+="$got"; fi
+        : >"$sig" 2>/dev/null || true
+    fi
     for f in "$HOME/.hermes/logs/errors.log" "$HOME/.hermes/logs/agent.log" "$HOME/.hermes/logs/gateway.log"; do
         [ -f "$f" ] || continue
         sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"; off="${HOFF[$f]:-}"
@@ -1570,6 +1685,10 @@ hermes_scan() {
             HOFF[$f]="$sz"
         fi
     done
+    # Plugin học giờ mở lại từ header retry-after của bridge → guard burn đúng hạn, khỏi probe IP.
+    if [ -n "$out" ]; then
+        HERMES_RESET_EXP="$(printf '%s' "$out" | grep -oE 'reset=[0-9]+' | tail -1 | cut -d= -f2 || true)"
+    fi
     HERMES_HIT="$out"
 }
 
@@ -1715,15 +1834,43 @@ guard_main() {
         HERMES_HIT=""
         if [ "${HERMES_WATCH:-1}" = "1" ] && hermes_plugin_patched; then hermes_scan; fi
         if [ -n "$HERMES_HIT" ]; then
-            echo "[$(date '+%H:%M:%S')] HERMES báo limit — xoay IP"
+            echo "[$(date '+%H:%M:%S')] HERMES báo limit — $([ -n "${HERMES_RESET_EXP:-}" ] && echo 'biết giờ mở lại từ bridge' || echo 'probe IP để lấy giờ mở lại')"
             guard_kill_resumes
-            burn_mark "$IP"
-            touch "$STATE_DIR/rotating.flag"
-            guard_rotate_until_ok "guard-hermes"
-            # IP trống (WARP chưa sẵn sàng) thì xoay thêm tối đa 2 lần — chỉ ở nhánh Hermes, không đụng nhánh OpenCode
-            local _hr=0
-            while [ -z "${IP:-}" ] && [ "$_hr" -lt 2 ]; do _hr=$(( _hr + 1 )); rotate "guard-hermes-retry" || true; done
-            rm -f "$STATE_DIR/rotating.flag"
+            local _hexp="${HERMES_RESET_EXP:-}" _hnow _hrotate=0
+            _hnow="$(date +%s)"
+            if [ -n "$_hexp" ] && [ "$_hexp" -gt "$_hnow" ] && [ $(( _hexp - _hnow )) -le 172800 ]; then
+                # Plugin đọc header retry-after của bridge → biết chính xác, không cần probe
+                burn_mark "$IP" "$_hexp"
+                printf '%s\n' "$_hexp" > "$RESET_FILE" 2>/dev/null || true
+                echo "    header retry-after: reset lúc $(date -d "@$_hexp" +%H:%M) → IP ${IP:-?} chặn tới đó (không probe)"
+                _hrotate=1
+            else
+                # Không có header (bridge cũ / upstream không gửi): probe chính IP này để lấy retryAfterMs
+                local _hprc=0
+                guard_probe || _hprc=$?
+                if [ "$_hprc" = 0 ]; then
+                    echo "    probe: IP ${IP:-?} vẫn còn quota — không xoay, chỉ /retry lại session"
+                else
+                    if [ -n "${PROBE_RESET_EXP:-}" ]; then
+                        burn_mark "$IP" "$PROBE_RESET_EXP"
+                        printf '%s\n' "$PROBE_RESET_EXP" > "$RESET_FILE" 2>/dev/null || true
+                        echo "    IP ${IP:-?} bị chặn tới $(date -d "@$PROBE_RESET_EXP" +%H:%M) (giờ mở lại đọc từ probe)"
+                    else
+                        burn_mark "$IP"
+                        echo "    probe: không đọc được giờ mở lại riêng — burn theo giờ reset chung đã lưu"
+                    fi
+                    _hrotate=1
+                fi
+            fi
+            if [ "$_hrotate" = 1 ]; then
+                touch "$STATE_DIR/rotating.flag"
+                guard_rotate_until_ok "guard-hermes"
+                # IP trống (WARP chưa sẵn sàng) thì xoay thêm tối đa 2 lần — chỉ ở nhánh Hermes, không đụng nhánh OpenCode
+                local _hr=0
+                while [ -z "${IP:-}" ] && [ "$_hr" -lt 2 ]; do _hr=$(( _hr + 1 )); rotate "guard-hermes-retry" || true; done
+                rm -f "$STATE_DIR/rotating.flag"
+            fi
+            : >"$HERMES_SIGNAL_FILE" 2>/dev/null || true
             hermes_send_retry
             sleep 3
             hermes_scan >/dev/null
