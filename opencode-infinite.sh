@@ -2029,6 +2029,44 @@ hermes_test_session() {
     tmux capture-pane -p -t "$T" | grep -v '^$' | tail -8 | cut -c1-140
 }
 
+# Đo khoảng nghỉ đăng ký tối ưu: với mỗi gap (giảm dần) đăng ký liên tục N lần, y hệt lúc guard chạy (delete+new+proxy mode+connect).
+# Gap nào chạy hết N lần không lỗi là an toàn; gap đầu tiên bị khoá thì dừng, đo luôn thời gian khoá, rồi khuyến nghị.
+# Dùng: ./opencode-infinite.sh --reg-test ["12 10 9 8 7 6 5"] [N=10]   (phải dừng guard trước)
+reg_gap_test() {
+    local gaps="${1:-12 10 9 8 7 6 5}" n="${2:-10}" g i ok fail el t0 best="" lt
+    if systemctl --user is-active --quiet opencode-guard 2>/dev/null; then
+        echo "Dừng guard trước khi đo:  systemctl --user stop opencode-guard"; return 1
+    fi
+    EGRESS=WARP; find_warp; warp_check_tunnel_danger || return 1
+    egress_connect || return 1
+    echo "Bắt đầu: mỗi gap đăng ký $n lần liên tục (WARP proxy mode, không đụng SSH). Ctrl+C để dừng."
+    for g in $gaps; do
+        WARP_REG_MIN_GAP="$g"; REG_LAST=0; ok=0; fail=0; t0=$SECONDS
+        echo "== gap ${g}s"
+        for i in $(seq 1 "$n"); do
+            warp_rotate
+            if [ "${REG_FAIL:-0}" = 1 ]; then fail=1; echo "   lần $i: LỖI (+$(( SECONDS - t0 ))s)"; break; fi
+            ok=$(( ok + 1 ))
+        done
+        el=$(( SECONDS - t0 ))
+        if [ "$fail" = 0 ]; then
+            echo "   -> gap ${g}s: OK $ok/$n trong ${el}s (thực tế ~$(( el / ok ))s/lần)"; best="$g"
+        else
+            echo "   -> gap ${g}s: BỊ KHOÁ sau $ok lần thành công (${el}s). Đo thời gian khoá..."
+            WARP_REG_MIN_GAP=0; lt=$SECONDS
+            while true; do
+                sleep 5; REG_LAST=0; warp_rotate
+                [ "${REG_FAIL:-0}" = 1 ] || break
+            done
+            echo "   -> khoá kéo dài ~$(( SECONDS - lt ))s"
+            break
+        fi
+    done
+    echo
+    if [ -z "$best" ]; then echo "KẾT QUẢ: ngay gap đầu đã bị khoá — thử gap lớn hơn: --reg-test \"20 16 14 12\""
+    else echo "KẾT QUẢ: gap nhỏ nhất không bị khoá = ${best}s → khuyến nghị WARP_REG_MIN_GAP=$(( best + 1 ))"; fi
+}
+
 probe_once() {
     find_opencode; [ -z "$OC_CMD" ] && { echo "không tìm thấy opencode"; return 1; }
     EGRESS="${GUARD_EGRESS:-WARP}"
@@ -2058,6 +2096,7 @@ main() {
         --hermes-check)    hermes_check; return ;;
         --rotate-once)     rotate_once; return ;;
         --probe-once)      probe_once; return ;;
+        --reg-test)        find_opencode; reg_gap_test "${2:-}" "${3:-10}"; return ;;
         --reset-info)      ri="$(limit_reset_info || true)"; if [ -n "$ri" ]; then rl=$(( ${ri%% *} - $(date +%s) )); ri="${ri% *}"; echo "reset lúc ${ri#* } — còn $(( rl / 3600 ))h$(( rl % 3600 / 60 ))m (epoch ${ri%% *})"; else echo "không đọc được giờ reset từ DB"; fi; return ;;
         --hermes-test-read)    hermes_test_read "${2:-600}"; return ;;
         --hermes-test-session) hermes_test_session; return ;;
